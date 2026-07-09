@@ -8,9 +8,9 @@ from src.config import ConfigError, load_config
 from src.label_assignment_pipeline import build_record_label_assignment_summary, run_label_assignment_pipeline
 from src.label_assignment_rule_validator import inspect_label_assignment
 from src.llm_client import LLMClient
-from src.question_plan_eval_pipeline import run_question_plan_eval_pipeline
-from src.question_plan_rule_validator import inspect_question_plan_quality
-from src.question_plan_service import evaluate_question_plan, evaluate_question_plans
+from src.question_plan.flows.legacy_pipeline import run_question_plan_eval_pipeline
+from src.question_plan.flows.service import evaluate_question_plan, evaluate_question_plans
+from src.question_plan.logic.rule_validator import inspect_question_plan_quality
 from src.real_data_flattener import flatten_real_data
 from src.real_interaction_classifier import classify_real_interaction, validate_real_interaction_type
 from src.real_pipeline import run_real_question_pipeline, validate_plan_alignment
@@ -570,3 +570,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
