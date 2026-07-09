@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+.cache/
+results/outputs/
+results/overview/
+results/quick_check/
+data/ocr-raw/
