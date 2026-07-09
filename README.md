@@ -158,10 +158,10 @@ src/utils.py
 
 Các lệnh dưới đây vẫn còn để debug hoặc đối chiếu kết quả cũ.
 
-Chạy report đánh giá `question_plan` cũ:
+Chạy report đánh giá `question_plan`:
 
 ```bash
-python cli.py --run-question-plan-quality-pipeline --input data/processed/math_9_bt_test.json
+python cli.py --evaluate-question-plan-service --input data/processed/math_9_bt_test.json
 ```
 
 Output legacy nằm trong:
