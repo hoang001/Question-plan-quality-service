@@ -44,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", default=None, help="Đường dẫn tới file JSON object hoặc list object source record.")
     parser.add_argument("--output", default=None, help="Ghi JSON output của service ra file thay vì stdout.")
     parser.add_argument("--model", default=None, help="Model dùng cho --ping. Nếu bỏ trống sẽ dùng PRIMARY_JUDGE_MODEL.")
+    parser.add_argument("--is-loop", action="store_true", help="Bật loop/refinement sau khi repair tạo new_question_plan.")
+    parser.add_argument("--max-loop", type=int, default=3, help="Số vòng loop tối đa, được clamp trong khoảng 1..3.")
     return parser
 
 
@@ -78,9 +80,21 @@ def main() -> int:
             input_path = resolve_input_path(args.input)
             payload = load_json_payload(input_path)
             if isinstance(payload, list):
-                result = evaluate_question_plans(payload, config=config, client=client)
+                result = evaluate_question_plans(
+                    payload,
+                    config=config,
+                    client=client,
+                    is_loop=args.is_loop,
+                    max_loop=args.max_loop,
+                )
             elif isinstance(payload, dict):
-                result = evaluate_question_plan(payload, config=config, client=client)
+                result = evaluate_question_plan(
+                    payload,
+                    config=config,
+                    client=client,
+                    is_loop=args.is_loop,
+                    max_loop=args.max_loop,
+                )
             else:
                 raise ValueError("--input phải là JSON object hoặc list object.")
 

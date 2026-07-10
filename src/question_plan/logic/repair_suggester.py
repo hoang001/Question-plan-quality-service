@@ -11,6 +11,7 @@ from copy import deepcopy
 from typing import Any
 
 from ..infra.config import AppConfig
+from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..knowledge.interaction_type_knowledge import compact_interaction_knowledge
 from ..knowledge.plan_knowledge import QUESTION_PLAN_EVAL_KNOWLEDGE
@@ -388,6 +389,8 @@ def suggest_question_plan_repair(
     plan_eval_result: dict[str, Any],
     config: AppConfig,
     client: LLMClient,
+    *,
+    debug: bool = False,
 ) -> dict[str, Any]:
     status = plan_eval_result.get("overall_status")
     if status in SKIP_REPAIR_STATUSES or status not in REPAIR_TRIGGER_STATUSES:
@@ -406,9 +409,11 @@ def suggest_question_plan_repair(
 
     model = config.primary_judge_model
     try:
+        messages = build_question_plan_repair_messages(record, plan_eval_result)
+        debug_llm_messages(step="question_plan_repair", model=model, messages=messages, debug=debug)
         response = client.chat_completion(
             model=model,
-            messages=build_question_plan_repair_messages(record, plan_eval_result),
+            messages=messages,
             temperature=0,
         )
         result = parse_and_normalize_repair_response(response=response, record=record)

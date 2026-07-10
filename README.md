@@ -48,6 +48,14 @@ curl -X POST http://localhost:8000/evaluate-question-plan ^
   -d @data/processed/one_record.json
 ```
 
+Bật loop/refinement tối đa 3 vòng:
+
+```bash
+curl -X POST "http://localhost:8000/evaluate-question-plan?is_loop=true&max_loop=3" ^
+  -H "Content-Type: application/json" ^
+  -d @data/processed/one_record.json
+```
+
 Trong Swagger UI tại `http://localhost:8000/docs`, mở endpoint
 `POST /evaluate-question-plan`, bấm **Try it out**, rồi dán cả JSON source
 record vào ô Request body. Không chỉ dán riêng nội dung `question`, vì service
@@ -73,6 +81,12 @@ Chạy với một record JSON:
 
 ```bash
 python cli.py --evaluate-question-plan-service --input data/processed/one_record.json
+```
+
+Chạy với loop/refinement:
+
+```bash
+python cli.py --evaluate-question-plan-service --input data/processed/one_record.json --is-loop --max-loop 3
 ```
 
 Chạy với list record:
@@ -118,18 +132,20 @@ Input là một source record object hoặc list source record:
 
 ## Output
 
-Output luôn có 4 field:
+Output luôn có 6 field:
 
 ```json
 {
   "is_good": true,
   "failed_reason": [],
   "suggestions": [],
-  "new_question_plan": null
+  "new_question_plan": null,
+  "is_loop": false,
+  "loop_count": 0
 }
 ```
 
-Nếu `is_good = false`, service trả lý do lỗi, gợi ý sửa, và `new_question_plan` nếu đủ an toàn để viết lại toàn bộ plan.
+Nếu `is_good = false`, service trả lý do lỗi, gợi ý sửa, và `new_question_plan` nếu đủ an toàn để viết lại toàn bộ plan. `loop_count` là số vòng refinement đã thực sự áp dụng candidate và judge lại.
 
 Service không tự sửa dữ liệu gốc, không trả patch, không trả before/after, và không ghi report/CSV.
 
@@ -139,7 +155,7 @@ Service không tự sửa dữ liệu gốc, không trả patch, không trả be
 2. LLM judge: đánh giá chất lượng tổng thể của plan ở cấp source record.
 3. Mapping-first evaluation: mapping từng yêu cầu chính của source sang vị trí trong plan trước khi kết luận coverage.
 4. Repair suggestion: nếu có lỗi, LLM đề xuất cách sửa và có thể trả `new_question_plan`.
-5. Service output: chuẩn hóa về 4 field `is_good`, `failed_reason`, `suggestions`, `new_question_plan`.
+5. Service output: chuẩn hóa về 6 field `is_good`, `failed_reason`, `suggestions`, `new_question_plan`, `is_loop`, `loop_count`.
 
 Điểm quan trọng: nếu một phần đã xuất hiện trong plan nhưng hỏi sai cách, đó là lỗi chất lượng/answerability, không phải thiếu coverage. Khi đó repair chỉ sửa đúng location đã match, không thêm questionOrder mới.
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import Body, Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 
 from .question_plan.flows.service import evaluate_question_plan, evaluate_question_plans
 
@@ -70,10 +70,12 @@ def evaluate_question_plan_api(
         description="Một source record object gồm question, answer và question_plan.",
         examples=[SOURCE_RECORD_EXAMPLE],
     ),
+    is_loop: bool = Query(default=False, description="Bật loop/refinement sau repair."),
+    max_loop: int = Query(default=3, description="Số vòng loop tối đa, service sẽ clamp trong khoảng 1..3."),
     _: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
     try:
-        return evaluate_question_plan(record)
+        return evaluate_question_plan(record, is_loop=is_loop, max_loop=max_loop)
     except HTTPException:
         raise
     except Exception as exc:
@@ -87,10 +89,12 @@ def evaluate_question_plans_api(
         description="Danh sách source record object.",
         examples=[[SOURCE_RECORD_EXAMPLE]],
     ),
+    is_loop: bool = Query(default=False, description="Bật loop/refinement sau repair cho từng record."),
+    max_loop: int = Query(default=3, description="Số vòng loop tối đa mỗi record, service sẽ clamp trong khoảng 1..3."),
     _: None = Depends(verify_api_key),
 ) -> list[dict[str, Any]]:
     try:
-        return evaluate_question_plans(records)
+        return evaluate_question_plans(records, is_loop=is_loop, max_loop=max_loop)
     except HTTPException:
         raise
     except Exception as exc:

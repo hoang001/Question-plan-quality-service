@@ -102,12 +102,21 @@ def normalize_text_list(value: Any) -> list[str]:
 
 def ensure_service_output_shape(result: dict[str, Any]) -> dict[str, Any]:
     is_good = bool(result.get("is_good"))
+    is_loop = bool(result.get("is_loop", False))
+    try:
+        loop_count = int(result.get("loop_count", 0) or 0)
+    except (TypeError, ValueError):
+        loop_count = 0
+    loop_count = max(0, loop_count)
+
     if is_good:
         return {
             "is_good": True,
             "failed_reason": [],
             "suggestions": [],
             "new_question_plan": None,
+            "is_loop": is_loop,
+            "loop_count": loop_count,
         }
 
     failed_reason = normalize_text_list(result.get("failed_reason"))
@@ -123,5 +132,6 @@ def ensure_service_output_shape(result: dict[str, Any]) -> dict[str, Any]:
         "failed_reason": failed_reason,
         "suggestions": suggestions,
         "new_question_plan": new_question_plan,
+        "is_loop": is_loop,
+        "loop_count": loop_count,
     }
-

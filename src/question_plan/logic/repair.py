@@ -31,8 +31,10 @@ def repair_question_plan(
     plan_eval_result: dict[str, Any],
     config: AppConfig,
     client: LLMClient,
+    *,
+    debug: bool = False,
 ) -> dict[str, Any]:
-    repair_result = suggest_question_plan_repair(record, plan_eval_result, config, client)
+    repair_result = suggest_question_plan_repair(record, plan_eval_result, config, client, debug=debug)
     new_question_plan = repair_result.get("rewritten_question_plan_preview")
     valid_plan, validation_errors = validate_question_plan(new_question_plan)
     suggestions = suggestion_texts(repair_result)

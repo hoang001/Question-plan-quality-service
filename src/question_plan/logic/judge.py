@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from ..infra.config import AppConfig
+from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..knowledge.interaction_type_knowledge import compact_interaction_knowledge
 from ..knowledge.plan_knowledge import QUESTION_PLAN_EVAL_KNOWLEDGE
@@ -276,11 +277,15 @@ def call_question_plan_judge(
     model: str,
     record: dict[str, Any],
     structural_result: dict[str, Any],
+    *,
+    debug: bool = False,
 ) -> dict[str, Any]:
     try:
+        messages = build_question_plan_judge_messages(record, structural_result)
+        debug_llm_messages(step="question_plan_judge", model=model, messages=messages, debug=debug)
         response = client.chat_completion(
             model=model,
-            messages=build_question_plan_judge_messages(record, structural_result),
+            messages=messages,
             temperature=0,
         )
         return normalize_judge_response(
@@ -328,11 +333,25 @@ def judge_question_plan(
     config: AppConfig,
     client: LLMClient,
     structural_result: dict[str, Any],
+    *,
+    debug: bool = False,
 ) -> dict[str, Any]:
-    primary = call_question_plan_judge(client, config.primary_judge_model, record, structural_result)
+    primary = call_question_plan_judge(
+        client,
+        config.primary_judge_model,
+        record,
+        structural_result,
+        debug=debug,
+    )
     fallback = None
     if should_call_fallback(primary, config):
-        fallback = call_question_plan_judge(client, config.fallback_judge_model, record, structural_result)
+        fallback = call_question_plan_judge(
+            client,
+            config.fallback_judge_model,
+            record,
+            structural_result,
+            debug=debug,
+        )
     chosen, policy = choose_result(primary, fallback)
     return {
         **chosen,
