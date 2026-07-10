@@ -28,6 +28,47 @@ REQUEST_TIMEOUT_SECONDS=60
 
 ## Chạy Service
 
+Chạy bằng FastAPI để mentor gọi test local:
+
+```bash
+uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Test health:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Test một record:
+
+```bash
+curl -X POST http://localhost:8000/evaluate-question-plan ^
+  -H "Content-Type: application/json" ^
+  -d @data/processed/one_record.json
+```
+
+Trong Swagger UI tại `http://localhost:8000/docs`, mở endpoint
+`POST /evaluate-question-plan`, bấm **Try it out**, rồi dán cả JSON source
+record vào ô Request body. Không chỉ dán riêng nội dung `question`, vì service
+cần cả `question_plan` để đánh giá.
+
+Test list record:
+
+```bash
+curl -X POST http://localhost:8000/evaluate-question-plans ^
+  -H "Content-Type: application/json" ^
+  -d @data/processed/math_9_bt_test.json
+```
+
+Nếu `.env` có `QUESTION_PLAN_API_KEY`, thêm header:
+
+```bash
+-H "X-API-Key: <key>"
+```
+
+Chạy bằng CLI:
+
 Chạy với một record JSON:
 
 ```bash
@@ -108,6 +149,7 @@ Service không tự sửa dữ liệu gốc, không trả patch, không trả be
 cli.py
 src/
   __init__.py
+  api.py
   question_plan/
     __init__.py
     flows/

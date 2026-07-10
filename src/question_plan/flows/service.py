@@ -14,7 +14,7 @@ from ..logic.rule_validator import validate_question_plan_structure
 from ..schemas.service_schema import ensure_service_output_shape
 
 
-SERVICE_ROOT_DIR = Path(__file__).resolve().parents[2]
+SERVICE_ROOT_DIR = Path(__file__).resolve().parents[3]
 
 
 def default_config() -> AppConfig:
