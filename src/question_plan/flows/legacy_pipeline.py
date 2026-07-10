@@ -1,4 +1,4 @@
-"""Pipeline for evaluating full question_plan quality per source record."""
+"""Pipeline cũ để đánh giá chất lượng question_plan theo từng source record."""
 
 from __future__ import annotations
 

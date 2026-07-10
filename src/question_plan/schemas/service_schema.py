@@ -1,4 +1,4 @@
-"""Service-facing schema helpers for question_plan evaluation."""
+"""Các helper schema dành cho service đánh giá question_plan."""
 
 from __future__ import annotations
 

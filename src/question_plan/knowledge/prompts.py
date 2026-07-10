@@ -1,4 +1,4 @@
-"""Prompt text blocks for question_plan judge and repair flows."""
+"""Các khối prompt cho luồng judge và repair question_plan."""
 
 JUDGE_SYSTEM_PROMPT = (
     "Bạn là LLM judge đánh giá chất lượng tổng thể của `question_plan` "

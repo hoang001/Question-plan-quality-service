@@ -1,4 +1,4 @@
-"""Compact service API for evaluating one source-record question_plan."""
+"""API service gọn để đánh giá question_plan của source record."""
 
 from __future__ import annotations
 

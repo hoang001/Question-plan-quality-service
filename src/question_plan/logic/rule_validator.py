@@ -1,7 +1,7 @@
-"""Structural validator for source-record-level question_plan quality checks.
+"""Validator cấu trúc cho kiểm tra chất lượng question_plan ở cấp source record.
 
-This module intentionally does not judge coverage, math correctness, or
-interactionType semantics. Those are LLM judge responsibilities.
+Module này không đánh giá coverage, độ đúng toán học hoặc semantic của
+interactionType. Những phần đó thuộc trách nhiệm của LLM judge.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Question plan quality service package."""
+"""Package service đánh giá chất lượng question_plan."""
 
 from .flows.service import evaluate_question_plan, evaluate_question_plans
 

@@ -1,4 +1,4 @@
-"""Schema normalization for question_plan quality evaluation results."""
+"""Chuẩn hóa schema cho kết quả đánh giá chất lượng question_plan."""
 
 from __future__ import annotations
 

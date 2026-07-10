@@ -1,2 +1,1 @@
-"""Question plan schemas and normalizers."""
-
+"""Schema và normalizer cho question_plan."""

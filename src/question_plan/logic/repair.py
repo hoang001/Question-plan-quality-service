@@ -1,7 +1,7 @@
-"""Service-facing question_plan repair wrapper.
+"""Wrapper repair question_plan dành cho service.
 
-This module returns only service-friendly repair data. It does not mutate input
-records and does not create report/replacement files.
+Module này chỉ trả dữ liệu repair thân thiện với service. Module không sửa
+record đầu vào và không tạo file report/replacement.
 """
 
 from __future__ import annotations

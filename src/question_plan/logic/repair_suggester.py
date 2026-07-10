@@ -1,7 +1,7 @@
-"""LLM repair suggestions for question_plan quality issues.
+"""Gợi ý sửa bằng LLM cho các vấn đề chất lượng question_plan.
 
-This module only creates reviewer-facing suggestions and optional rewritten
-question_plan previews. It never mutates input records.
+Module này chỉ tạo gợi ý cho reviewer và preview question_plan sau sửa nếu có.
+Module không bao giờ sửa trực tiếp record đầu vào.
 """
 
 from __future__ import annotations
