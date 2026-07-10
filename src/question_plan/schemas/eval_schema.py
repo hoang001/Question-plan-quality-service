@@ -6,7 +6,7 @@ from collections import Counter
 import re
 from typing import Any
 
-from ...real_schema import content_to_text
+from ..shared.real_schema import content_to_text
 
 
 PLAN_EVAL_STATUSES = {

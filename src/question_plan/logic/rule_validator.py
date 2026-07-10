@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from ...real_schema import VALID_REAL_INTERACTION_TYPES, content_to_text
+from ..shared.real_schema import VALID_REAL_INTERACTION_TYPES, content_to_text
 
 
 def has_text(value: Any) -> bool:

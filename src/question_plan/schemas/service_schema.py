@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...real_schema import VALID_REAL_INTERACTION_TYPES
+from ..shared.real_schema import VALID_REAL_INTERACTION_TYPES
 
 
 VALID_INTERACTION_TYPES = VALID_REAL_INTERACTION_TYPES

@@ -10,9 +10,9 @@ import json
 from copy import deepcopy
 from typing import Any
 
-from ...config import AppConfig
-from ...interaction_type_knowledge import compact_interaction_knowledge
-from ...llm_client import LLMClient
+from ..infra.config import AppConfig
+from ..infra.llm_client import LLMClient
+from ..knowledge.interaction_type_knowledge import compact_interaction_knowledge
 from ..knowledge.plan_knowledge import QUESTION_PLAN_EVAL_KNOWLEDGE
 from ..knowledge.prompts import (
     REPAIR_MAPPING_RULES,
@@ -21,8 +21,8 @@ from ..knowledge.prompts import (
     REPAIR_SYSTEM_PROMPT,
     REPAIR_TASK_INSTRUCTIONS,
 )
-from ...real_schema import VALID_REAL_INTERACTION_TYPES, content_to_text
-from ...utils import parse_json_output
+from ..shared.real_schema import VALID_REAL_INTERACTION_TYPES, content_to_text
+from ..shared.utils import parse_json_output
 
 
 REPAIR_TRIGGER_STATUSES = {"warning", "needs_review", "bad", "structural_error"}

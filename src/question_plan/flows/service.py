@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ...config import AppConfig, load_config
-from ...llm_client import LLMClient
+from ..infra.config import AppConfig, load_config
+from ..infra.llm_client import LLMClient
 from ..schemas.eval_schema import structural_error_result
 from ..logic.judge import judge_question_plan
 from ..logic.repair import repair_question_plan

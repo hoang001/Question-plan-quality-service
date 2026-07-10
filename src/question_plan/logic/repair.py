@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...config import AppConfig
-from ...llm_client import LLMClient
+from ..infra.config import AppConfig
+from ..infra.llm_client import LLMClient
 from .repair_suggester import suggest_question_plan_repair
 from ..schemas.service_schema import validate_question_plan
 

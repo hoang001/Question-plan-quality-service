@@ -1,13 +1,12 @@
-# LLM Model Tester
+# Question Plan Quality Service
 
-Công cụ đánh giá chất lượng `question_plan` từ source record Toán.
+Service đánh giá chất lượng `question_plan` từ một source record Toán.
 
-Đường chạy chính hiện tại là **Question Plan Service**: nhận một record có `question_plan`, trả về đúng 4 field để tích hợp vào hệ thống chính. Các pipeline ghi report/CSV cũ vẫn còn trong repo để debug hoặc đối chiếu, nhưng không phải đường chạy chính.
+Luồng chính hiện tại chỉ tập trung vào `question_plan`: nhận raw question, raw answer nếu có, và `question_plan`; sau đó trả về kết quả JSON gọn để hệ thống khác tích hợp.
 
-## Cài Đặt
+## Cài đặt
 
 ```bash
-cd llm_model_tester
 python -m pip install -r requirements.txt
 copy .env.example .env
 ```
@@ -27,15 +26,7 @@ USE_JUDGE_FALLBACK=true
 REQUEST_TIMEOUT_SECONDS=60
 ```
 
-## CLI Chính
-
-File CLI chính là:
-
-```bash
-python cli.py ...
-```
-
-## Question Plan Service
+## Chạy Service
 
 Chạy với một record JSON:
 
@@ -55,10 +46,17 @@ Ghi output ra file:
 python cli.py --evaluate-question-plan-service --input data/processed/math_9_bt_test.json --output results/question_plan_service_output.json
 ```
 
+Kiểm tra kết nối model:
+
+```bash
+python cli.py --list-models
+python cli.py --ping
+python cli.py --ping --model qwen3.6-35b
+```
 
 ## Input
 
-Input là một source record object:
+Input là một source record object hoặc list source record:
 
 ```json
 {
@@ -77,11 +75,9 @@ Input là một source record object:
 }
 ```
 
-CLI service nhận được cả object đơn lẻ hoặc list object.
-
 ## Output
 
-Output luôn có đúng 4 field:
+Output luôn có 4 field:
 
 ```json
 {
@@ -92,125 +88,59 @@ Output luôn có đúng 4 field:
 }
 ```
 
-Nếu `is_good = false`:
+Nếu `is_good = false`, service trả lý do lỗi, gợi ý sửa, và `new_question_plan` nếu đủ an toàn để viết lại toàn bộ plan.
 
-```json
-{
-  "is_good": false,
-  "failed_reason": [
-    "Hệ phương trình b vô nghiệm nhưng question_plan yêu cầu học sinh nhập giá trị x và y cụ thể."
-  ],
-  "suggestions": [
-    "Sửa questionOrder 2 thành yêu cầu học sinh kết luận hệ phương trình vô nghiệm."
-  ],
-  "new_question_plan": {
-    "type": "advanced_question_plan",
-    "plan": []
-  }
-}
-```
+Service không tự sửa dữ liệu gốc, không trả patch, không trả before/after, và không ghi report/CSV.
 
-`new_question_plan` là object `question_plan` sau sửa. Service không trả full source record, không trả patch, không trả before/after, và không tự sửa dữ liệu gốc.
+## Luồng Xử Lý
 
-## Logic Chính
+1. Structural validation: kiểm tra `question_plan` có đúng shape/schema cơ bản không.
+2. LLM judge: đánh giá chất lượng tổng thể của plan ở cấp source record.
+3. Mapping-first evaluation: mapping từng yêu cầu chính của source sang vị trí trong plan trước khi kết luận coverage.
+4. Repair suggestion: nếu có lỗi, LLM đề xuất cách sửa và có thể trả `new_question_plan`.
+5. Service output: chuẩn hóa về 4 field `is_good`, `failed_reason`, `suggestions`, `new_question_plan`.
 
-Service đánh giá `question_plan` theo các tiêu chí:
+Điểm quan trọng: nếu một phần đã xuất hiện trong plan nhưng hỏi sai cách, đó là lỗi chất lượng/answerability, không phải thiếu coverage. Khi đó repair chỉ sửa đúng location đã match, không thêm questionOrder mới.
 
-- Bao phủ đủ yêu cầu chính của đề gốc.
-- Không làm sai ý nghĩa toán học.
-- Không yêu cầu học sinh nhập đáp án không tồn tại hoặc không chấm được.
-- `interactionRequirement` đủ rõ để bước generation tiếp tục sinh câu hỏi/options/answerSpec.
-- `interactionType` phù hợp với hành động học sinh cần làm.
-- Không dùng field ngoài schema `question_plan`.
-
-Điểm quan trọng: nếu một phần đã xuất hiện trong plan nhưng hỏi sai cách, đó là lỗi chất lượng/answerability, không phải thiếu coverage. Ví dụ hệ c đã có ở `questionOrder 3` nhưng nghiệm tổng quát mà plan yêu cầu nhập một cặp `x/y` cụ thể thì chỉ sửa `questionOrder 3`, không thêm `questionOrder 4`.
-
-## Code Chính
+## Cấu Trúc Code
 
 ```text
-src/question_plan_service.py
+cli.py
+src/
+  __init__.py
+  question_plan/
+    __init__.py
+    flows/
+      service.py
+    infra/
+      config.py
+      llm_client.py
+    logic/
+      judge.py
+      repair.py
+      repair_suggester.py
+      rule_validator.py
+    knowledge/
+      plan_knowledge.py
+      interaction_type_knowledge.py
+      prompts.py
+      alias.py
+    schemas/
+      service_schema.py
+      eval_schema.py
+    shared/
+      real_schema.py
+      utils.py
 ```
 
-Entry point để tích hợp:
+## Entry Point Tích Hợp
 
 ```python
-from src.question_plan_service import evaluate_question_plan, evaluate_question_plans
+from src.question_plan.flows.service import evaluate_question_plan, evaluate_question_plans
 
 result = evaluate_question_plan(record)
 results = evaluate_question_plans(records)
 ```
-
-Các module liên quan:
-
-```text
-src/question_plan_judge.py       # gọi LLM judge chất lượng plan
-src/question_plan_repair.py      # wrapper tạo new_question_plan
-src/question_plan_schema.py      # validate question_plan và normalize service output
-src/question_plan_eval_schema.py # schema/normalize nội bộ của judge
-src/question_plan_rule_validator.py
-src/interaction_type_knowledge.py
-src/llm_client.py
-src/config.py
-src/utils.py
-```
-
-## Legacy / Debug Pipelines
-
-Các lệnh dưới đây vẫn còn để debug hoặc đối chiếu kết quả cũ.
-
-Chạy report đánh giá `question_plan`:
-
-```bash
-python cli.py --evaluate-question-plan-service --input data/processed/math_9_bt_test.json
-```
-
-Output legacy nằm trong:
-
-```text
-results/outputs/plan_quality/
-```
-
-Chạy quick check source/raw không OCR:
-
-```bash
-python cli.py --run-quick-check --input data/processed/math_9_bt_test.json --skip-pdf
-```
-
-Chạy quick check có OCR:
-
-```bash
-python cli.py --run-source-record-pipeline --input data/processed/math_9_bt_test.json --pdf "path/to/book.pdf" --refresh-ocr-cache
-```
-
-Các output này phục vụ debug, không phải contract service.
-
-## Kiểm Tra Model
-
-```bash
-python cli.py --list-models
-python cli.py --ping
-python cli.py --ping --model qwen3.6-35b
-```
-
-## Dữ Liệu
-
-```text
-data/processed/
-```
-
-JSON record/list record đã chuẩn bị để chạy service.
-
-```text
-data/raw/mentor/
-```
-
-File gốc mentor gửi, ví dụ PDF.
-
-```text
-data/ocr-raw/
-```
-
-Cache OCR, không nên commit.
 
 ## Git Hygiene
 
@@ -218,10 +148,8 @@ Không commit:
 
 ```text
 .env
-results/outputs/
-results/overview/
-results/quick_check/
+cache/
 data/ocr-raw/
-.cache/
+results/
 __pycache__/
 ```

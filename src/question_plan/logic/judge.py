@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ...config import AppConfig
-from ...interaction_type_knowledge import compact_interaction_knowledge
-from ...llm_client import LLMClient
+from ..infra.config import AppConfig
+from ..infra.llm_client import LLMClient
+from ..knowledge.interaction_type_knowledge import compact_interaction_knowledge
 from ..knowledge.plan_knowledge import QUESTION_PLAN_EVAL_KNOWLEDGE
 from ..knowledge.prompts import (
     JUDGE_ANSWERABILITY_POLICY,
@@ -33,8 +33,8 @@ from ..schemas.eval_schema import (
     REQUIRED_RESULT_FIELDS,
     normalize_question_plan_eval_result,
 )
-from ...real_schema import content_to_text
-from ...utils import parse_json_output
+from ..shared.real_schema import content_to_text
+from ..shared.utils import parse_json_output
 
 
 def truncate(value: Any, limit: int = 6000) -> str:
