@@ -2,7 +2,10 @@
 __pycache__/
 *.py[cod]
 .cache/
+cache/
+results/
 results/outputs/
 results/overview/
 results/quick_check/
 data/ocr-raw/
+.pytest_cache/

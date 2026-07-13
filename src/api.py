@@ -9,6 +9,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 
+from .question_plan.flows.generated_question_service import evaluate_generated_questions
 from .question_plan.flows.service import evaluate_question_plan, evaluate_question_plans
 
 
@@ -49,6 +50,56 @@ SOURCE_RECORD_EXAMPLE: dict[str, Any] = {
     },
     "start_page": None,
     "end_page": None,
+}
+
+
+GENERATED_QUESTION_OBJECT_EXAMPLE: dict[str, Any] = {
+    "_id": "generated-demo-001",
+    "aiId": "demo-ai-flow",
+    "difficulty": "easy",
+    "bloom": "apply",
+    "interactionTypes": ["short_answer"],
+    "instruction": [{"id": "intro", "type": "text", "text": "Giải phương trình 2x + 3 = 7."}],
+    "questionItems": [
+        {
+            "id": "item-demo-001",
+            "stem": [{"id": "stem", "type": "text", "text": "Nhập giá trị của x."}],
+            "interactions": [
+                {
+                    "id": "x_value",
+                    "type": "short_answer",
+                    "config": {"inputMode": "numeric"},
+                    "display": {"layout": "auto"},
+                }
+            ],
+            "answerSpecs": [
+                {
+                    "interactionId": "x_value",
+                    "type": "short_answer",
+                    "expected": [
+                        {
+                            "inputMode": "numeric",
+                            "value": {"correctValue": 2, "acceptableValues": []},
+                            "equivalence": {"type": "numeric_equivalence"},
+                        }
+                    ],
+                }
+            ],
+        }
+    ],
+    "solutions": [
+        {
+            "solverName": "default",
+            "solutionContent": [{"id": "solution", "type": "text", "text": "Ta có x = 2."}],
+        }
+    ],
+}
+
+
+GENERATED_QUESTION_WRAPPER_EXAMPLE: dict[str, Any] = {
+    "_id": "source-record-demo",
+    "name": "Wrapper demo",
+    "generatedQuestions": [GENERATED_QUESTION_OBJECT_EXAMPLE],
 }
 
 
@@ -99,3 +150,35 @@ def evaluate_question_plans_api(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi khi đánh giá danh sách question_plan: {exc}") from exc
+
+
+@app.post("/evaluate-generated-questions")
+def evaluate_generated_questions_api(
+    payload: Any = Body(
+        ...,
+        description=(
+            "Một generated question object, list generated question object, "
+            "hoặc wrapper cũ có field generatedQuestions."
+        ),
+        examples=[GENERATED_QUESTION_OBJECT_EXAMPLE, [GENERATED_QUESTION_OBJECT_EXAMPLE], GENERATED_QUESTION_WRAPPER_EXAMPLE],
+    ),
+    strict_mode: bool = Query(default=True, description="Nếu true, warning/needs_review cũng làm is_good=false."),
+    debug: bool = Query(default=False, description="Bật debug metadata an toàn cho prompt/LLM call."),
+    auto_repair: bool = Query(default=False, description="Bật LLM repair cho generated question có lỗi."),
+    is_loop: bool = Query(default=False, description="Bật loop/refinement sau repair."),
+    max_loop: int = Query(default=3, description="Số vòng loop tối đa, service clamp trong khoảng 1..3."),
+    _: None = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        return evaluate_generated_questions(
+            payload,
+            strict_mode=strict_mode,
+            debug=debug,
+            auto_repair=auto_repair,
+            is_loop=is_loop,
+            max_loop=max_loop,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi đánh giá generatedQuestions: {exc}") from exc
