@@ -7,6 +7,7 @@ question_plan, không dùng raw question/raw answer và không so sánh với so
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..knowledge.interaction_type_knowledge import INTERACTION_TYPE_KNOWLEDGE
@@ -15,12 +16,13 @@ from ..shared.real_schema import content_to_text
 
 SEVERITIES = {"warning", "needs_review", "bad"}
 CATEGORIES = {
+    "solution_anchor_consistency",
     "answer_internal_consistency",
     "interaction_schema",
     "choice_quality",
     "hint_quality",
     "solution_quality",
-    "difficulty_fit",
+    "spelling_wording",
     "render_schema",
     "pedagogical_quality",
     "runtime",
@@ -31,6 +33,141 @@ VALID_GENERATED_INTERACTION_TYPES = set(INTERACTION_TYPE_KNOWLEDGE) | {"essay"}
 GENERATED_OBJECT_HINT_KEYS = {"instruction", "questionItems", "interactions", "solutions", "interactionTypes"}
 
 
+def location_to_json_pointer(location: str) -> str:
+    text = str(location or "").strip()
+    if not text:
+        return ""
+    if text.startswith("/"):
+        return text
+    if text == "generatedQuestion":
+        return ""
+    if text.startswith("generatedQuestion."):
+        text = text[len("generatedQuestion.") :]
+    if text in {"input", "generatedQuestions"}:
+        return text
+    parts: list[str] = []
+    for chunk in text.split("."):
+        if not chunk:
+            continue
+        match = re.match(r"^([^\[]+)((?:\[\d+\])*)$", chunk)
+        if not match:
+            return str(location or "").strip()
+        key, indexes = match.groups()
+        parts.append(key)
+        parts.extend(re.findall(r"\[(\d+)\]", indexes))
+    return "/" + "/".join(parts) if parts else ""
+
+
+def pointer_tokens(pointer: str) -> list[str]:
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        return []
+    return pointer.strip("/").split("/") if pointer else []
+
+
+def question_item_index_from_pointer(pointer: str) -> str | None:
+    tokens = pointer_tokens(pointer)
+    for index, token in enumerate(tokens[:-1]):
+        if token == "questionItems" and tokens[index + 1].isdigit():
+            return tokens[index + 1]
+    return None
+
+
+def solution_index_from_pointer(pointer: str) -> str | None:
+    tokens = pointer_tokens(pointer)
+    for index, token in enumerate(tokens[:-1]):
+        if token == "solutions" and tokens[index + 1].isdigit():
+            return tokens[index + 1]
+    return None
+
+
+def default_repair_intent(category: str, reason: str = "", location: str = "") -> str:
+    del reason, location
+    if category == "solution_anchor_consistency":
+        return "align_fields_to_solution"
+    if category == "answer_internal_consistency":
+        return "needs_manual_review"
+    if category == "spelling_wording":
+        return "fix_spelling_wording"
+    if category == "choice_quality":
+        return "improve_distractors"
+    if category == "hint_quality":
+        return "reduce_hint_leakage"
+    if category == "solution_quality":
+        return "clean_solution_reasoning"
+    if category in {"interaction_schema", "render_schema", "runtime"}:
+        return "fix_schema"
+    if category == "pedagogical_quality":
+        return "improve_stem_clarity"
+    return "needs_manual_review"
+
+
+def default_context_paths(category: str, location: str) -> list[str]:
+    pointer = location_to_json_pointer(location)
+    paths: list[str] = []
+    if pointer.startswith("/"):
+        paths.append(pointer)
+
+    item_index = question_item_index_from_pointer(pointer)
+    if item_index is not None:
+        item_prefix = f"/questionItems/{item_index}"
+        if category in {"solution_anchor_consistency", "answer_internal_consistency", "choice_quality"}:
+            paths.extend(
+                [
+                    "/instruction",
+                    f"{item_prefix}/stem",
+                    f"{item_prefix}/interactions",
+                    f"{item_prefix}/answerSpecs",
+                    "/solutions",
+                ]
+            )
+        elif category == "hint_quality":
+            paths.extend(
+                [
+                    f"{item_prefix}/stem",
+                    f"{item_prefix}/hints",
+                    f"{item_prefix}/interactions",
+                    f"{item_prefix}/answerSpecs",
+                    "/solutions",
+                ]
+            )
+        elif category == "pedagogical_quality":
+            paths.extend(
+                [
+                    "/instruction",
+                    f"{item_prefix}/stem",
+                    f"{item_prefix}/interactions",
+                    f"{item_prefix}/answerSpecs",
+                ]
+            )
+        elif category in {"interaction_schema", "render_schema"}:
+            paths.extend([item_prefix, f"{item_prefix}/interactions", f"{item_prefix}/answerSpecs"])
+
+    solution_index = solution_index_from_pointer(pointer)
+    if category == "solution_quality":
+        paths.append("/instruction")
+        if item_index is not None:
+            item_prefix = f"/questionItems/{item_index}"
+            paths.extend([f"{item_prefix}/stem", f"{item_prefix}/interactions", f"{item_prefix}/answerSpecs"])
+        else:
+            paths.append("/questionItems")
+        if solution_index is not None:
+            paths.append(f"/solutions/{solution_index}")
+        elif pointer.startswith("/solutions"):
+            paths.append("/solutions")
+
+    result: list[str] = []
+    for path in paths:
+        if path and path not in result:
+            result.append(path)
+    return result
+
+
+def error_snippet_from_text(*values: Any, limit: int = 240) -> str:
+    text = " ".join(str(value or "").strip() for value in values if str(value or "").strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
 def make_issue(
     *,
     severity: str,
@@ -38,13 +175,22 @@ def make_issue(
     location: str,
     reason: str,
     suggestion: str,
-) -> dict[str, str]:
+    error_snippet: str = "",
+    required_context_paths: list[str] | None = None,
+    repair_intent: str = "",
+) -> dict[str, Any]:
+    normalized_category = category if category in CATEGORIES else "runtime"
+    normalized_location = location_to_json_pointer(location)
+    normalized_paths = required_context_paths or default_context_paths(normalized_category, normalized_location)
     return {
         "severity": severity if severity in SEVERITIES else "needs_review",
-        "category": category if category in CATEGORIES else "runtime",
-        "location": location,
+        "category": normalized_category,
+        "location": normalized_location,
         "reason": reason,
         "suggestion": suggestion,
+        "error_snippet": error_snippet or error_snippet_from_text(reason, suggestion),
+        "required_context_paths": normalized_paths,
+        "repair_intent": repair_intent or default_repair_intent(normalized_category, reason, normalized_location),
     }
 
 
@@ -102,10 +248,30 @@ def text_list(value: Any) -> list[str]:
     return result
 
 
-def normalize_issue(value: Any, index: int) -> dict[str, str]:
+def normalize_issue(value: Any, index: int) -> dict[str, Any]:
     issue = value if isinstance(value, dict) else {}
     severity = str(issue.get("severity") or "").strip()
     category = str(issue.get("category") or "").strip()
+    if category == "answer_validity":
+        category = "solution_anchor_consistency"
+    raw_paths = issue.get("required_context_paths")
+    required_context_paths = None
+    if isinstance(raw_paths, list):
+        required_context_paths = []
+        for path in raw_paths:
+            pointer = location_to_json_pointer(str(path or "").strip())
+            if pointer.startswith("/") and pointer not in required_context_paths:
+                required_context_paths.append(pointer)
+    return make_issue(
+        severity=severity if severity in SEVERITIES else "needs_review",
+        category=category if category in CATEGORIES else "runtime",
+        location=str(issue.get("location") or f"issues[{index}]").strip(),
+        reason=str(issue.get("reason") or "Issue thiếu reason rõ ràng.").strip(),
+        suggestion=str(issue.get("suggestion") or "Cần review thủ công.").strip(),
+        error_snippet=str(issue.get("error_snippet") or "").strip(),
+        required_context_paths=required_context_paths,
+        repair_intent=str(issue.get("repair_intent") or "").strip(),
+    )
     return make_issue(
         severity=severity if severity in SEVERITIES else "needs_review",
         category=category if category in CATEGORIES else "runtime",
@@ -113,6 +279,24 @@ def normalize_issue(value: Any, index: int) -> dict[str, str]:
         reason=str(issue.get("reason") or "Issue thiếu reason rõ ràng.").strip(),
         suggestion=str(issue.get("suggestion") or "Cần review thủ công.").strip(),
     )
+
+
+def is_ignored_metadata_issue(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    category = str(value.get("category") or "").strip()
+    if category == "difficulty_fit":
+        return True
+    text = " ".join(
+        str(value.get(key) or "")
+        for key in ("location", "reason", "suggestion")
+    ).lower()
+    return "difficulty" in text or "bloom" in text or "độ khó" in text
+
+
+def is_ignored_metadata_text(value: Any) -> bool:
+    text = str(value or "").lower()
+    return "difficulty" in text or "bloom" in text or "độ khó" in text or "do kho" in text
 
 
 def normalize_generated_question_result(
@@ -139,12 +323,13 @@ def normalize_generated_question_result(
             index=index,
         )
 
-    issues = [normalize_issue(issue, issue_index) for issue_index, issue in enumerate(raw_issues)]
+    filtered_issues = [issue for issue in raw_issues if not is_ignored_metadata_issue(issue)]
+    issues = [normalize_issue(issue, issue_index) for issue_index, issue in enumerate(filtered_issues)]
     blocking = STRICT_BLOCKING_SEVERITIES if strict_mode else NON_STRICT_BLOCKING_SEVERITIES
     is_good = not any(issue["severity"] in blocking for issue in issues)
 
-    failed_reason = text_list(result.get("failed_reason"))
-    suggestions = text_list(result.get("suggestions"))
+    failed_reason = [text for text in text_list(result.get("failed_reason")) if not is_ignored_metadata_text(text)]
+    suggestions = [text for text in text_list(result.get("suggestions")) if not is_ignored_metadata_text(text)]
     if not is_good:
         for issue in issues:
             if issue["severity"] in blocking and issue["reason"] not in failed_reason:
@@ -785,6 +970,11 @@ def validate_generated_question_object(generated_question: Any, index: int = 0) 
         for interaction_id in interaction_ids:
             interaction_type = interaction_types.get(interaction_id, "")
             if interaction_id in answer_spec_interaction_ids:
+                continue
+            if interaction_type == "essay" and (
+                has_essay_rubric_or_grading(generated_question, item, answer_specs)
+                or has_solution(generated_question)
+            ):
                 continue
             severity = "needs_review" if interaction_type in {"essay", "short_answer"} else "bad"
             issues.append(

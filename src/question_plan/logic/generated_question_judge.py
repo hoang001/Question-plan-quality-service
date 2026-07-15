@@ -57,6 +57,12 @@ def build_generated_question_judge_messages(
     output_schema_text: str,
 ) -> list[dict[str, str]]:
     payload = compact_generated_question_payload(generated_question, schema_validation_result)
+    vietnamese_output_policy = (
+        "Chính sách ngôn ngữ bắt buộc: mọi chuỗi người đọc trong output JSON phải viết bằng tiếng Việt có dấu. "
+        "Áp dụng cho failed_reason, suggestions, issues[].reason, issues[].suggestion và mọi notes nếu có. "
+        "Không dùng câu tiếng Anh. Chỉ giữ nguyên tiếng Anh/ký hiệu khi đó là tên field, enum, id, JSON Pointer, "
+        "code, LaTeX hoặc nội dung trích nguyên văn từ generated question."
+    )
     return [
         {
             "role": "system",
@@ -64,8 +70,9 @@ def build_generated_question_judge_messages(
                 "Bạn là LLM judge đánh giá chất lượng nội bộ của một generated question object "
                 "cho câu hỏi Toán tương tác. Chỉ đánh giá generated question được cung cấp. "
                 "Không dùng question_plan, raw question, raw answer, source images hoặc answer images. "
-                "Không tạo new_question_plan và không repair dữ liệu. "
-                "Toàn bộ reason/suggestion phải viết bằng tiếng Việt."
+                "Không tạo new_question_plan và không repair dữ liệu. Không xác định đáp án đúng, không tự giải bài "
+                "và không dùng kiến thức chuyên môn để phủ định solution hoặc answerSpec. "
+                f"{vietnamese_output_policy}"
             ),
         },
         {
@@ -77,8 +84,20 @@ def build_generated_question_judge_messages(
                 "- Không hard-code theo id/_id/aiId cụ thể.\n"
                 "- Không so sánh với question_plan hoặc source/raw question/raw answer.\n"
                 "- Không tạo category plan_alignment hoặc source_fidelity.\n"
+                "- Bỏ qua hoàn toàn difficulty và bloom; không tạo issue, failed_reason hoặc suggestion liên quan đến hai field này.\n"
+                f"- {vietnamese_output_policy}\n"
+                "- Nếu criteria/type rules/schema/payload có tiếng Anh, vẫn phải diễn giải lỗi và gợi ý bằng tiếng Việt có dấu.\n"
+                "- Với mỗi issue có thể sửa, trả location dạng JSON Pointer, error_snippet ngắn, required_context_paths đủ hẹp và repair_intent.\n"
+                "- Không tạo answer_internal_consistency, solution_anchor_consistency hoặc repair_intent fix_correct_option.\n"
+                "- Không kiểm tra hint đúng/sai theo đáp án; hint alignment thuộc Solution Resolver. Chỉ kiểm tra hint quá lộ đáp án hoặc chất lượng trình bày bề mặt.\n"
+                "- Distractor được phép sai có chủ đích về số mũ, hệ số, dấu, đơn vị hoặc phép biến đổi. Sự gần giống đáp án không phải bằng chứng typo.\n"
+                "- Chỉ báo choice_quality khi option rỗng, trùng/tương đương hoàn toàn, hỏng render, vô nghĩa hoặc không thể dùng.\n"
+                "- Với lỗi trình bày solution, required_context_paths cần gồm solution block liên quan.\n"
+                "- Với lỗi hint, required_context_paths cần gồm stem, answerSpecs và hints liên quan.\n"
+                "- Nếu không chắc context đủ để sửa scoped an toàn, đặt repair_intent='needs_manual_review'.\n"
                 "- Chỉ trả JSON object hợp lệ, không markdown, không giải thích ngoài JSON.\n"
                 "- Nếu thiếu bằng chứng để kết luận chắc chắn, dùng severity needs_review.\n\n"
+                "- Chỉ đánh giá solution dài dòng, thử-sai, tự vấn hoặc có đoạn nháp; không thay đổi/kết luận lại final answer.\n\n"
                 "QUALITY CRITERIA:\n"
                 f"{criteria_text}\n\n"
                 "GENERATED QUESTION TYPE RULES:\n"

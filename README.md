@@ -72,15 +72,15 @@ Lệnh ngắn mặc định:
 python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json
 ```
 
-Lệnh trên tự bật:
+Nếu muốn chỉ đánh giá một số object đầu tiên:
 
-- `auto_repair=true`
-- `is_loop=true`
-- `max_loop=3`
-- ghi full JSON result
-- ghi Markdown report
-- ghi list object đã sửa thành công
-- ghi mapping repair
+```bash
+python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json --amount 50
+```
+
+Nếu bỏ trống `--amount`, CLI sẽ đánh giá toàn bộ input.
+
+Lệnh trên mặc định chỉ check, không tự repair. Output JSON mặc định là compact: chỉ gồm `id`, `is_good`, `issues`, `new_generated_question`.
 
 Các file output mặc định:
 
@@ -88,13 +88,24 @@ Các file output mặc định:
 results/generated_question_check_repair_output.json
 results/generated_question_repair_report.md
 results/generated_question_repaired_objects.json
-results/generated_question_repair_mapping.json
 ```
 
-Nếu muốn chỉ check, không repair:
+Nếu muốn bật repair tự động:
 
 ```bash
-python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json --no-auto-repair
+python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json --auto-repair
+```
+
+Nếu muốn repair rồi check lại tối đa 3 vòng:
+
+```bash
+python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json --auto-repair --max-loop 3
+```
+
+Nếu muốn xem diagnostics nội bộ:
+
+```bash
+python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json --debug
 ```
 
 Nếu muốn truyền output path riêng:
@@ -102,17 +113,18 @@ Nếu muốn truyền output path riêng:
 ```bash
 python cli.py --evaluate-generated-questions-service ^
   --input data/processed/math_9_bt_test.json ^
+  --auto-repair ^
+  --max-loop 3 ^
   --output results/generated_question_check_repair_output.json ^
   --report-output results/generated_question_repair_report.md ^
-  --repaired-output results/generated_question_repaired_objects.json ^
-  --repair-mapping-output results/generated_question_repair_mapping.json
+  --repaired-output results/generated_question_repaired_objects.json
 ```
 
 ### Ý Nghĩa Output
 
 `generated_question_check_repair_output.json`
 
-Full result để debug/tích hợp, gồm summary, issues, repair status và `new_generated_question` nếu sửa được.
+Compact result để tích hợp, gồm summary, issues đã dedupe/prioritize và `new_generated_question` nếu sửa được. Chạy thêm `--debug` nếu cần diagnostics nội bộ.
 
 `generated_question_repair_report.md`
 
@@ -121,10 +133,6 @@ Report cho người đọc, tóm tắt good/bad/needs_review/warning, lỗi từ
 `generated_question_repaired_objects.json`
 
 Chỉ chứa list generated question object đã sửa thành công. File này không có issues/report metadata, phù hợp để đưa sang pipeline tiếp theo.
-
-`generated_question_repair_mapping.json`
-
-Mapping trace object nào đã sửa, object nào skipped/failed.
 
 ### Chạy Bằng API/Swagger
 
@@ -145,12 +153,21 @@ curl -X POST "http://localhost:8000/evaluate-generated-questions?strict_mode=tru
 API mặc định `auto_repair=false` để tránh sửa ngoài ý muốn. Muốn test repair trên Swagger hoặc curl thì bật:
 
 ```bash
-curl -X POST "http://localhost:8000/evaluate-generated-questions?strict_mode=true&auto_repair=true&is_loop=true&max_loop=3" ^
+curl -X POST "http://localhost:8000/evaluate-generated-questions?strict_mode=true&auto_repair=true&max_loop=3" ^
   -H "Content-Type: application/json" ^
   -d @data/processed/math_9_bt_test.json
 ```
 
-Trong Swagger, mở `POST /evaluate-generated-questions`, bấm **Try it out**, dán object JSON vào body và bật query params nếu cần repair.
+Trong Swagger, endpoint generated question chỉ còn các query params public: `strict_mode`, `debug`, `auto_repair`, `max_loop`.
+
+Các policy đã được internal hóa:
+
+- Flow generated question chạy theo thứ tự structural validator → Solution Resolver → Generic Quality Judge → normalize/repair.
+- Solution Resolver là nguồn semantic duy nhất khi đối chiếu `solutions` với `answerSpecs/options/hints`.
+- Generic Quality Judge không tự xác định đáp án đúng và không coi distractor gần đáp án là lỗi gõ.
+- Không tự giải lại bài từ `instruction/stem`.
+- Không check spelling/wording của input ban đầu.
+- Chỉ dùng spelling/render guardrail cho text do repair sinh ra.
 
 ## Question Plan Service
 
@@ -166,6 +183,8 @@ CLI:
 ```bash
 python cli.py --evaluate-question-plan-service --input data/processed/math_9_bt_test.json
 ```
+
+Với input dạng list, có thể thêm `--amount 50` để chỉ đánh giá 50 record đầu.
 
 Output chuẩn:
 

@@ -162,11 +162,10 @@ def evaluate_generated_questions_api(
         ),
         examples=[GENERATED_QUESTION_OBJECT_EXAMPLE, [GENERATED_QUESTION_OBJECT_EXAMPLE], GENERATED_QUESTION_WRAPPER_EXAMPLE],
     ),
-    strict_mode: bool = Query(default=True, description="Nếu true, warning/needs_review cũng làm is_good=false."),
-    debug: bool = Query(default=False, description="Bật debug metadata an toàn cho prompt/LLM call."),
-    auto_repair: bool = Query(default=False, description="Bật LLM repair cho generated question có lỗi."),
-    is_loop: bool = Query(default=False, description="Bật loop/refinement sau repair."),
-    max_loop: int = Query(default=3, description="Số vòng loop tối đa, service clamp trong khoảng 1..3."),
+    strict_mode: bool = Query(default=True, description="Nếu true, needs_review/bad làm is_good=false."),
+    debug: bool = Query(default=False, description="false trả compact output; true trả diagnostics an toàn."),
+    auto_repair: bool = Query(default=False, description="Bật repair tự động nếu lỗi sửa được an toàn."),
+    max_loop: int = Query(default=1, description="Số vòng repair/check tối đa, service clamp trong khoảng 1..3."),
     _: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
     try:
@@ -175,7 +174,6 @@ def evaluate_generated_questions_api(
             strict_mode=strict_mode,
             debug=debug,
             auto_repair=auto_repair,
-            is_loop=is_loop,
             max_loop=max_loop,
         )
     except HTTPException:

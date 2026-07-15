@@ -1,34 +1,29 @@
-# Generated Question Judge Output Schema
+# Generic Quality Judge Output Schema
 
-LLM phải trả về JSON object hợp lệ, không markdown, không giải thích ngoài JSON.
+Chỉ trả JSON object hợp lệ:
 
 ```json
 {
+  "id": "",
   "is_good": true,
   "failed_reason": [],
   "suggestions": [],
   "issues": [
     {
       "severity": "warning|needs_review|bad",
-      "category": "answer_internal_consistency|interaction_schema|choice_quality|hint_quality|solution_quality|difficulty_fit|render_schema|pedagogical_quality|runtime",
+      "category": "choice_quality|hint_quality|solution_quality|render_schema|pedagogical_quality|runtime",
       "location": "",
       "reason": "",
-      "suggestion": ""
+      "suggestion": "",
+      "error_snippet": "",
+      "required_context_paths": [],
+      "repair_intent": "improve_distractors|reduce_hint_leakage|clean_solution_reasoning|fix_schema|improve_stem_clarity|needs_manual_review"
     }
   ]
 }
 ```
 
-## Field Rules
-
-- `is_good` phải là boolean.
-- `failed_reason` là list string.
-- `suggestions` là list string.
-- `issues` là list object, có thể rỗng.
-- Mỗi issue phải có đủ `severity`, `category`, `location`, `reason`, `suggestion`.
-- Chỉ dùng severity/category trong enum cho phép.
-- Không dùng category `plan_alignment`.
-- Không dùng category `source_fidelity`.
-- Toàn bộ `reason` và `suggestion` viết bằng tiếng Việt.
-- Không đề xuất sửa `question_plan` trong output này.
-- Không trả `new_question_plan`.
+- Không trả `answer_internal_consistency`, `solution_anchor_consistency`, `fix_correct_option` hoặc semantic hint alignment.
+- `solution_quality` chỉ dùng cho lỗi trình bày solution và intent `clean_solution_reasoning`.
+- `choice_quality` không dùng để phán công thức/đáp án đúng sai.
+- Mọi chuỗi diễn giải phải là tiếng Việt có dấu.
