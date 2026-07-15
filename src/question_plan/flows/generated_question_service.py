@@ -210,7 +210,10 @@ def without_judge_solution_semantics(result: dict[str, Any]) -> dict[str, Any]:
         intent = str(issue.get("repair_intent") or "")
         if category in {"answer_internal_consistency", "solution_anchor_consistency"} or intent == "fix_correct_option":
             continue
-        if category == "solution_quality" and intent != "clean_solution_reasoning":
+        if category == "solution_quality" and intent not in {
+            "clean_solution_reasoning",
+            "needs_manual_review",
+        }:
             continue
         if category == "hint_quality" and intent == "align_hint_to_solution":
             continue

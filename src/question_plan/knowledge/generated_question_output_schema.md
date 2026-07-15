@@ -31,6 +31,9 @@ Quy tắc đường dẫn bắt buộc:
 - Ví dụ sai: `/$/solutions/0`, `$.solutions[0]`, `/generatedQuestion/solutions/0`.
 
 - Không trả `answer_internal_consistency`, `solution_anchor_consistency`, `fix_correct_option` hoặc semantic hint alignment.
-- `solution_quality` chỉ dùng cho lỗi trình bày solution và intent `clean_solution_reasoning`.
+- `solution_quality` dùng `clean_solution_reasoning` khi solution đã có
+  lập luận nhưng trình bày dài dòng, thử-sai, tự vấn hoặc chứa đoạn nháp.
+- `solution_quality` dùng `needs_manual_review` khi solution chỉ nêu đáp án
+  cuối mà không có nội dung giải thích; không tự viết lời giải mới.
 - `choice_quality` không dùng để phán công thức/đáp án đúng sai.
 - Mọi chuỗi diễn giải phải là tiếng Việt có dấu.
