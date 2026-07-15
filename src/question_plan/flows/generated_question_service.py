@@ -107,6 +107,22 @@ def compact_issue(issue: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_solution_anchor_result(anchor: dict[str, Any]) -> dict[str, Any]:
+    answer = anchor.get("final_answer") if isinstance(anchor.get("final_answer"), dict) else {}
+    compact_answer = {
+        key: answer.get(key)
+        for key in ("text", "matched_option_id", "correctOptionIds", "expected")
+        if answer.get(key) not in (None, "", [])
+    }
+    compact_anchor: dict[str, Any] = {
+        "resolver_status": anchor.get("resolver_status"),
+        "answerSpec_matches_solution": anchor.get("answerSpec_matches_solution"),
+    }
+    if compact_answer:
+        compact_anchor["final_answer"] = compact_answer
+    return compact_anchor
+
+
 def public_generated_question_result(result: dict[str, Any], *, debug: bool) -> dict[str, Any]:
     issues = canonical_issues(result.get("issues") or [])
     repaired = result.get("new_generated_question") if isinstance(result.get("new_generated_question"), dict) else None
@@ -121,16 +137,14 @@ def public_generated_question_result(result: dict[str, Any], *, debug: bool) -> 
     debug_result: dict[str, Any] = {
         "id": result.get("id"),
         "is_good": bool(result.get("is_good")),
-        "issues": issues,
+        "issues": [compact_issue(issue) for issue in issues],
         "new_generated_question": repaired,
     }
     anchor = result.get("solution_anchor_result")
     if isinstance(anchor, dict):
-        debug_result["solution_anchor_result"] = anchor
+        debug_result["solution_anchor_result"] = compact_solution_anchor_result(anchor)
     if result.get("repair_status") and result.get("repair_status") != "skipped":
         debug_result["repair_status"] = result["repair_status"]
-    if isinstance(result.get("selected_issue"), dict):
-        debug_result["selected_issue"] = result["selected_issue"]
     if result.get("patches"):
         debug_result["repair_patches"] = result["patches"]
     if result.get("repair_loop_count"):

@@ -39,7 +39,7 @@ Generic Quality Judge chỉ kiểm tra clarity, presentation, option rỗng/dupl
 
 ## Issue/output
 
-Issue được deduplicate theo `category + location + repair_intent + normalized reason`. `issues` là danh sách public duy nhất. Debug chỉ có thể thêm resolver result, `selected_issue` ngắn, patch, loop count và stop reason; không lặp reason/suggestion.
+Issue được deduplicate theo `category + location + repair_intent + normalized reason`. `issues` là danh sách public duy nhất. Debug chỉ thêm kết quả resolver dạng ngắn, trạng thái repair, patch, số vòng và lý do dừng; không trả `error_snippet`, `required_context_paths`, `fields_to_fix`, danh sách issue lặp trong resolver hoặc `selected_issue`.
 
 Compact item:
 
