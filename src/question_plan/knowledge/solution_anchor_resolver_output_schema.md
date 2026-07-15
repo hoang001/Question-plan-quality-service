@@ -34,6 +34,13 @@ Chỉ trả JSON object hợp lệ:
 }
 ```
 
+Quy tắc đường dẫn bắt buộc:
+
+- `location` và `fields_to_fix[].path` phải là JSON Pointer bắt đầu trực tiếp bằng `/`.
+- Không dùng ký hiệu gốc `$`, `$.` hoặc `/$/`.
+- Ví dụ đúng: `/questionItems/0/answerSpecs/0/expected/correctOptionId`, `/questionItems/0/hints/1/content/0/text`.
+- Ví dụ sai: `/$/questionItems/0/answerSpecs/0`, `$.questionItems[0]`, `/generatedQuestion/questionItems/0`.
+
 - `resolved`: solution có kết luận cuối cụ thể và cardinality phù hợp interaction type.
 - `needs_manual_review`: solution thiếu kết luận hoặc có số đáp án cuối không phù hợp interaction type.
 - `resolved` phải có ít nhất một giá trị trong `final_answer`.

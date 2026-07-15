@@ -73,12 +73,19 @@ def is_safe_generated_question_patch_path(path: str) -> bool:
 
 
 def unique_paths(paths: list[str]) -> list[str]:
-    result: list[str] = []
+    normalized: list[str] = []
     for value in paths:
         pointer = location_to_json_pointer(str(value or "").strip())
-        if pointer.startswith("/") and pointer not in result:
-            result.append(pointer)
-    return result
+        if pointer.startswith("/") and pointer not in normalized:
+            normalized.append(pointer)
+    return [
+        pointer
+        for pointer in normalized
+        if not any(
+            other != pointer and other.startswith(f"{pointer}/")
+            for other in normalized
+        )
+    ]
 
 
 def build_scoped_repair_context(
@@ -100,15 +107,17 @@ def build_scoped_repair_context(
         ]
     )
     context: dict[str, Any] = {}
-    try:
-        for path in paths:
+    for path in paths:
+        try:
             context[path] = get_by_json_pointer(generated_question, path)
-    except JsonPointerError as exc:
-        return {"context_ok": False, "reason": str(exc)}
+        except JsonPointerError as exc:
+            return {"context_ok": False, "reason": f"Đường dẫn `{path}` không tồn tại: {exc}"}
 
+    normalized_issue = compact_issue_for_repair(issue)
+    normalized_issue["location"] = location
     payload = {
         "generated_question_id": generated_question_id(generated_question),
-        "issue": compact_issue_for_repair(issue),
+        "issue": normalized_issue,
         "check_result": compact_check_result_for_repair(check_result),
         "extracted_context": context,
     }

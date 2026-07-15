@@ -37,6 +37,14 @@ def location_to_json_pointer(location: str) -> str:
     text = str(location or "").strip()
     if not text:
         return ""
+    if text in {"$", "/$"}:
+        return ""
+    if text.startswith("/$/"):
+        text = text[2:]
+    elif text.startswith("$/"):
+        text = text[1:]
+    elif text.startswith("$."):
+        text = text[2:]
     if text.startswith("/"):
         return text
     if text == "generatedQuestion":
