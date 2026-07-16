@@ -163,8 +163,8 @@ def evaluate_generated_questions_api(
         examples=[GENERATED_QUESTION_OBJECT_EXAMPLE, [GENERATED_QUESTION_OBJECT_EXAMPLE], GENERATED_QUESTION_WRAPPER_EXAMPLE],
     ),
     strict_mode: bool = Query(default=True, description="Nếu true, needs_review/bad làm is_good=false."),
-    debug: bool = Query(default=False, description="false trả compact output; true trả diagnostics an toàn."),
-    auto_repair: bool = Query(default=False, description="Bật repair tự động nếu lỗi sửa được an toàn."),
+    debug: bool = Query(default=True, description="false trả compact output; true trả diagnostics an toàn."),
+    auto_repair: bool = Query(default=True, description="Bật repair tự động nếu lỗi sửa được an toàn."),
     max_loop: int = Query(default=1, description="Số vòng repair/check tối đa, service clamp trong khoảng 1..3."),
     _: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
