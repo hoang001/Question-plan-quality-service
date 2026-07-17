@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..infra.config import AppConfig
+from ..infra.config import AppConfig, generated_question_fast_model, generated_question_reasoning_model
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..shared.utils import parse_json_output
@@ -136,7 +136,7 @@ def build_generated_question_scoped_repair_messages(
             "role": "system",
             "content": (
                 "Bạn sửa một issue cụ thể bằng JSON Patch trên generated question. Chỉ scoped repair, không full rewrite, "
-                "không tự giải bài và không tạo đáp án mới. Solution Resolver final_answer là mốc phải giữ nguyên. "
+                "không tự giải bài và không tạo đáp án mới. Final answer đã viết trong solution là mốc phải giữ nguyên. "
                 "Chỉ trả JSON hợp lệ; reason/suggestion phải là tiếng Việt có dấu."
             ),
         },
@@ -254,15 +254,20 @@ def repair_generated_question_scoped(
         load_text(REPAIR_RULES_PATH),
         load_text(SCOPED_REPAIR_OUTPUT_SCHEMA_PATH),
     )
+    model = (
+        generated_question_fast_model(config)
+        if issue.get("repair_intent") == "fix_schema"
+        else generated_question_reasoning_model(config)
+    )
     try:
         debug_llm_messages(
             step="generated_question_scoped_repair",
-            model=config.primary_judge_model,
+            model=model,
             messages=messages,
             debug=debug,
         )
         response = client.chat_completion(
-            model=config.primary_judge_model,
+            model=model,
             messages=messages,
             temperature=0,
         )

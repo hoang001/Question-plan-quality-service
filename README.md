@@ -162,9 +162,11 @@ Trong Swagger, endpoint generated question chỉ còn các query params public: 
 
 Các policy đã được internal hóa:
 
-- Flow generated question chạy theo thứ tự structural validator → Solution Resolver → Generic Quality Judge → normalize/repair.
+- Flow generated question chạy theo thứ tự structural validator → Solution Quality Judge (dùng Judge hiện có) → solution quality gate → Solution Resolver → normalize/repair.
+- Nếu solution cần làm sạch hoặc review, flow xử lý solution trước và chưa căn chỉnh `answerSpecs`/options/hints; Resolver chỉ chạy khi solution vượt qua quality gate.
 - Solution Resolver là nguồn semantic duy nhất khi đối chiếu `solutions` với `answerSpecs/options/hints`.
-- Generic Quality Judge không tự xác định đáp án đúng và không coi distractor gần đáp án là lỗi gõ.
+- Payload của Judge chỉ chứa ID cần thiết, instruction, stem, interaction type và solutions; không gửi answerSpecs, expected, options hoặc hints.
+- Judge chỉ kiểm tra chất lượng, độ đầy đủ và tính nhất quán nội bộ của solution; không đánh giá distractor, hint leakage, option semantic quality hoặc generic pedagogical/render quality.
 - Không tự giải lại bài từ `instruction/stem`.
 - Không check spelling/wording của input ban đầu.
 - Chỉ dùng spelling/render guardrail cho text do repair sinh ra.
@@ -234,7 +236,6 @@ src/
       interaction_type_knowledge.py
       prompts.py
       generated_question_quality_criteria.md
-      generated_question_type_rules.md
       generated_question_output_schema.md
     schemas/
       service_schema.py
@@ -273,7 +274,6 @@ src/question_plan/logic/generated_question_repair.py
 src/question_plan/logic/generated_question_schema.py
 src/question_plan/logic/generated_question_schema_inspector.py
 src/question_plan/knowledge/generated_question_quality_criteria.md
-src/question_plan/knowledge/generated_question_type_rules.md
 src/question_plan/knowledge/generated_question_output_schema.md
 docs/generated_question_quality_flow.md
 tests/test_generated_question_service.py

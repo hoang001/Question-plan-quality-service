@@ -9,8 +9,9 @@ Chỉ xử lý generated question object/list/wrapper `generatedQuestions`. Khô
 ```text
 Generated question
 → Structural validator bằng code
-→ LLM Solution Resolver
-→ LLM Generic Quality Judge
+→ LLM Solution Quality Judge (dùng Judge hiện có)
+→ Solution quality gate
+→ LLM Solution Resolver khi solution đạt gate
 → Normalize/deduplicate issues
 → Scoped repair nếu auto_repair=true
 → Compact output
@@ -26,7 +27,9 @@ Solution Resolver là nguồn semantic duy nhất cho:
 - hint alignment khi solution resolved;
 - solution thiếu kết luận hoặc có nhiều đáp án cuối không hợp lệ.
 
-Generic Quality Judge chỉ kiểm tra clarity, presentation, option rỗng/duplicate/malformed, hint leakage, solution dài dòng/thử-sai/tự vấn và chất lượng sư phạm bề mặt. Judge không xác định đáp án đúng, không emit `answer_internal_consistency`, `solution_anchor_consistency` hoặc `fix_correct_option`. Distractor sai số mũ/hệ số/dấu/đơn vị có thể hợp lệ và không bị coi là typo chỉ vì gần canonical answer.
+Judge hiện có đã được thu hẹp thành Solution Quality Judge. Payload LLM đầu tiên chỉ gồm question ID cần thiết, instruction, stem, interaction type và solutions; không chứa answerSpecs, expected, options, hints, resolver result hoặc schema diagnostics. Judge kiểm tra dữ kiện đầu vào của solution, phép tính và suy luận cục bộ, bước chính, nhánh/điều kiện, độ đầy đủ, dữ liệu ngoài JSON, cùng lỗi dài dòng/thử-sai/tự vấn/đoạn nháp. Judge không đánh giá answerSpec, option, hint, distractor, render hoặc generic pedagogical quality.
+
+Nếu Judge tạo `solution_quality/clean_solution_reasoning`, flow ưu tiên làm sạch rồi check lại solution. Nếu Judge tạo `solution_quality/needs_manual_review`, flow dừng semantic alignment và không gọi Resolver. Trường hợp thiếu bảng/hình/đồ thị cần thiết trong JSON cũng đi theo nhánh manual review này. Chỉ solution vượt qua gate mới được dùng để đối chiếu answerSpec/options/hints.
 
 ## Repair
 
@@ -36,6 +39,7 @@ Generic Quality Judge chỉ kiểm tra clarity, presentation, option rỗng/dupl
 - `fix_schema`: patch structural/render nhỏ.
 - Không full repair, không tự giải lại bài, không tạo đáp án mới.
 - Resolver `needs_manual_review` thì không sửa answerSpec/options/hints/solution.
+- Thứ tự repair là solution trước, sau đó mới đến `align_fields_to_solution`, `align_hint_to_solution` và các sửa chữa khác.
 
 ## Issue/output
 

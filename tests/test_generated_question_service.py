@@ -13,7 +13,6 @@ from src.question_plan.logic.generated_question_judge import build_generated_que
 from src.question_plan.logic.generated_question_schema import (
     normalize_generated_question_input,
     normalize_generated_question_result,
-    validate_generated_question_schema,
 )
 from src.question_plan.logic.generated_question_repair import (
     build_generated_question_scoped_repair_messages,
@@ -571,13 +570,10 @@ def test_generated_checker_ignores_difficulty_and_bloom_issues():
 def test_generated_question_prompt_excludes_wrapper_fields():
     wrapper = make_wrapper()
     generated = normalize_generated_question_input(wrapper)[0]
-    schema_result = validate_generated_question_schema(generated)
 
     messages = build_generated_question_judge_messages(
         generated,
-        schema_result,
         "criteria",
-        "type rules",
         "output schema",
     )
     prompt = "\n".join(message["content"] for message in messages)
@@ -589,7 +585,6 @@ def test_generated_question_prompt_excludes_wrapper_fields():
 
 def test_generated_question_llm_prompts_require_vietnamese_output():
     generated = make_single_choice_generated()
-    schema_result = validate_generated_question_schema(generated)
     check_result = {
         "id": "generated_1",
         "is_good": False,
@@ -618,9 +613,7 @@ def test_generated_question_llm_prompts_require_vietnamese_output():
         message["content"]
         for message in build_generated_question_judge_messages(
             generated,
-            schema_result,
             "criteria",
-            "type rules",
             "output schema",
         )
     )

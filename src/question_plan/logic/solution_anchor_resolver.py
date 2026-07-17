@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..infra.config import AppConfig
+from ..infra.config import AppConfig, generated_question_reasoning_model
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..shared.real_schema import content_to_text
@@ -355,15 +355,16 @@ def resolve_solution_anchor_consistency(
         load_text(RESOLVER_RULES_PATH),
         load_text(RESOLVER_OUTPUT_SCHEMA_PATH),
     )
+    model = generated_question_reasoning_model(config)
     try:
         debug_llm_messages(
             step="solution_anchor_resolver",
-            model=config.primary_judge_model,
+            model=model,
             messages=messages,
             debug=debug,
         )
         response = client.chat_completion(
-            model=config.primary_judge_model,
+            model=model,
             messages=messages,
             temperature=0,
         )

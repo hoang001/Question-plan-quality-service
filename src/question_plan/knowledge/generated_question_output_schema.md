@@ -1,4 +1,4 @@
-# Generic Quality Judge Output Schema
+# Solution Quality Judge Output Schema
 
 Chỉ trả JSON object hợp lệ:
 
@@ -10,30 +10,26 @@ Chỉ trả JSON object hợp lệ:
   "suggestions": [],
   "issues": [
     {
-      "severity": "warning|needs_review|bad",
-      "category": "choice_quality|hint_quality|solution_quality|render_schema|pedagogical_quality|runtime",
-      "location": "",
+      "severity": "warning|needs_review",
+      "category": "solution_quality",
+      "location": "/solutions/0/solutionContent/0/text",
       "reason": "",
       "suggestion": "",
       "error_snippet": "",
-      "required_context_paths": [],
-      "repair_intent": "improve_distractors|reduce_hint_leakage|clean_solution_reasoning|fix_schema|improve_stem_clarity|needs_manual_review"
+      "required_context_paths": ["/solutions/0/solutionContent/0/text"],
+      "repair_intent": "clean_solution_reasoning|needs_manual_review"
     }
   ]
 }
 ```
 
-Quy tắc đường dẫn bắt buộc:
+Quy tắc:
 
-- `location` và mọi phần tử trong `required_context_paths` phải là JSON Pointer bắt đầu trực tiếp bằng `/`.
-- Không dùng ký hiệu gốc `$`, `$.` hoặc `/$/`.
-- Ví dụ đúng: `/solutions/0/solutionContent/0/text`, `/questionItems/0/hints/1/content/0/text`, `/questionItems/0/interactions/0/config/options/2/content/0/text`.
-- Ví dụ sai: `/$/solutions/0`, `$.solutions[0]`, `/generatedQuestion/solutions/0`.
-
-- Không trả `answer_internal_consistency`, `solution_anchor_consistency`, `fix_correct_option` hoặc semantic hint alignment.
-- `solution_quality` dùng `clean_solution_reasoning` khi solution đã có
-  lập luận nhưng trình bày dài dòng, thử-sai, tự vấn hoặc chứa đoạn nháp.
-- `solution_quality` dùng `needs_manual_review` khi solution chỉ nêu đáp án
-  cuối mà không có nội dung giải thích; không tự viết lời giải mới.
-- `choice_quality` không dùng để phán công thức/đáp án đúng sai.
-- Mọi chuỗi diễn giải phải là tiếng Việt có dấu.
+- `location` và mọi `required_context_paths` phải là JSON Pointer bắt đầu bằng `/` và trỏ tới solution block liên quan.
+- Không dùng `$`, `$.`, `/$/` hoặc đường dẫn ngoài generated question.
+- Dùng `clean_solution_reasoning` khi chỉ cần làm gọn trình bày mà vẫn giữ nguyên toàn bộ logic toán học và final answer.
+- Dùng severity `needs_review` và `needs_manual_review` cho phép tính/biến đổi sai, thiếu bước chính, thiếu quá trình giải, thiếu nhánh/điều kiện, thiếu dữ liệu ngoài JSON hoặc solution không đủ để kiểm chứng.
+- Nếu một lỗi gây sai dây chuyền, chỉ trả issue cho bước sai rõ ràng đầu tiên.
+- Không trả category hoặc repair intent nào khác.
+- Không tự tạo phép sửa toán học, bước giải hoặc final answer thay thế.
+- Mọi reason/suggestion phải viết bằng tiếng Việt có dấu.

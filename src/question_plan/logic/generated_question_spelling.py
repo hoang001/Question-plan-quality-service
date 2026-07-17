@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..infra.config import AppConfig
+from ..infra.config import AppConfig, generated_question_fast_model
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..shared.utils import parse_json_output
@@ -394,10 +394,11 @@ def check_spelling_and_wording(
     rules_text = load_text(SPELLING_RULES_PATH)
     output_schema_text = load_text(SPELLING_OUTPUT_SCHEMA_PATH)
     messages = build_generated_question_spelling_messages(candidate_nodes, rules_text, output_schema_text)
+    model = generated_question_fast_model(config)
     start = time.perf_counter()
     try:
-        debug_llm_messages(step="generated_question_spelling", model=config.primary_judge_model, messages=messages, debug=debug)
-        response = client.chat_completion(model=config.primary_judge_model, messages=messages, temperature=0)
+        debug_llm_messages(step="generated_question_spelling", model=model, messages=messages, debug=debug)
+        response = client.chat_completion(model=model, messages=messages, temperature=0)
         parsed, ok, parse_error = parse_json_output(str(response.get("content") or ""))
         if not ok:
             llm_result = normalize_spelling_llm_result(

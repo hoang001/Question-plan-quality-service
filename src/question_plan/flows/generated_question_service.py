@@ -198,43 +198,26 @@ def merge_anchor_result(
     return merged
 
 
-def without_judge_solution_semantics(result: dict[str, Any]) -> dict[str, Any]:
-    """The generic judge must not duplicate resolver-owned solution semantics."""
+def solution_quality_gate_issues(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return solution issues that must be handled before downstream alignment."""
 
-    filtered = dict(result)
-    filtered_issues: list[dict[str, Any]] = []
-    for issue in result.get("issues") or []:
-        if not isinstance(issue, dict):
-            continue
-        category = str(issue.get("category") or "")
-        intent = str(issue.get("repair_intent") or "")
-        if category in {"answer_internal_consistency", "solution_anchor_consistency"} or intent == "fix_correct_option":
-            continue
-        if category == "solution_quality" and intent not in {
-            "clean_solution_reasoning",
-            "needs_manual_review",
-        }:
-            continue
-        if category == "hint_quality" and intent == "align_hint_to_solution":
-            continue
-        filtered_issues.append(issue)
-    filtered["issues"] = filtered_issues
-    return filtered
-
-
-def suppress_downstream_issues_for_manual_anchor(
-    result: dict[str, Any],
-    anchor: dict[str, Any],
-) -> dict[str, Any]:
-    if anchor.get("resolver_status") != "needs_manual_review":
-        return result
-    filtered = dict(result)
-    filtered["issues"] = [
+    return [
         issue
         for issue in result.get("issues") or []
-        if isinstance(issue, dict) and issue.get("category") not in {"solution_quality", "hint_quality"}
+        if isinstance(issue, dict)
+        and issue.get("category") == "solution_quality"
+        and issue.get("repair_intent") in {"clean_solution_reasoning", "needs_manual_review"}
     ]
-    return filtered
+
+
+def select_solution_quality_gate_issue(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Prefer a manual solution blocker over a presentation-only cleanup."""
+
+    issues = solution_quality_gate_issues(result)
+    return next(
+        (issue for issue in issues if issue.get("repair_intent") == "needs_manual_review"),
+        next((issue for issue in issues if issue.get("repair_intent") == "clean_solution_reasoning"), None),
+    )
 
 
 def text_node_map(generated_question: dict[str, Any]) -> dict[str, str]:
@@ -281,6 +264,9 @@ def validate_repaired_text(
 
 
 def select_repair_issue(check_result: dict[str, Any]) -> dict[str, Any] | None:
+    solution_issue = select_solution_quality_gate_issue(check_result)
+    if solution_issue:
+        return solution_issue
     issues = [issue for issue in check_result.get("issues") or [] if isinstance(issue, dict)]
     ordered = sorted(issues, key=issue_sort_key)
     repairable = {
@@ -314,7 +300,18 @@ def repair_once(
     index: int,
     debug: bool,
 ) -> dict[str, Any]:
-    anchor = check_result.get("solution_anchor_result")
+    solution_issue = select_solution_quality_gate_issue(check_result)
+    if solution_issue and solution_issue.get("repair_intent") != "clean_solution_reasoning":
+        return {
+            "repair_status": "needs_manual_review",
+            "failed_reason": ["Solution có vấn đề nội dung cần review trước khi căn chỉnh các field khác."],
+            "suggestions": ["Review thủ công solution; chưa sửa answerSpec/options/hints."],
+            "new_generated_question": None,
+            "patches": [],
+            "selected_issue": compact_selected_issue(solution_issue),
+        }
+
+    anchor = {} if solution_issue else check_result.get("solution_anchor_result")
     anchor = anchor if isinstance(anchor, dict) else {}
     if anchor.get("resolver_status") == "needs_manual_review":
         selected = select_repair_issue(check_result)
@@ -353,7 +350,7 @@ def repair_once(
         result["selected_issue"] = compact_selected_issue(selected)
         return result
 
-    issue = select_repair_issue(check_result)
+    issue = solution_issue or select_repair_issue(check_result)
     if not issue:
         return {"repair_status": "failed", "new_generated_question": None, "patches": []}
     if issue.get("repair_intent") not in {
@@ -447,8 +444,6 @@ def maybe_repair_generated_question(
             stop_reason = str(last_result.get("repair_status") or "repair_failed")
             break
         last_success = last_result
-        if loop_count >= clamp_loop_count(max_loop):
-            break
         current_question = candidate
         current_result = evaluate_generated_question_object(
             current_question,
@@ -458,10 +453,12 @@ def maybe_repair_generated_question(
             debug=debug,
             index=index,
             auto_repair=False,
-            max_loop=1,
+            max_loop=3,
         )
         if current_result.get("is_good"):
             stop_reason = "recheck_good"
+            break
+        if loop_count >= clamp_loop_count(max_loop):
             break
 
     chosen = last_success if last_result and last_result.get("repair_status") != "repaired" and last_success else last_result
@@ -493,25 +490,14 @@ def evaluate_generated_question_object(
         else:
             config = config or default_config()
             client = client or LLMClient(config)
-            anchor = resolve_solution_anchor_consistency(
+            judge_result = judge_generated_question_object(
                 generated_question,
-                config=config,
-                client=client,
+                schema_result,
+                config,
+                client,
+                strict_mode=strict_mode,
+                index=index,
                 debug=debug,
-            )
-            judge_result = suppress_downstream_issues_for_manual_anchor(
-                without_judge_solution_semantics(
-                    judge_generated_question_object(
-                        generated_question,
-                        schema_result,
-                        config,
-                        client,
-                        strict_mode=strict_mode,
-                        index=index,
-                        debug=debug,
-                    )
-                ),
-                anchor,
             )
             checked = merge_generated_question_results(
                 schema_issues=schema_issues,
@@ -520,13 +506,20 @@ def evaluate_generated_question_object(
                 generated_question=generated_question,
                 index=index,
             )
-            checked = merge_anchor_result(
-                checked,
-                anchor,
-                strict_mode=strict_mode,
-                generated_question=generated_question,
-                index=index,
-            )
+            if not solution_quality_gate_issues(checked):
+                anchor = resolve_solution_anchor_consistency(
+                    generated_question,
+                    config=config,
+                    client=client,
+                    debug=debug,
+                )
+                checked = merge_anchor_result(
+                    checked,
+                    anchor,
+                    strict_mode=strict_mode,
+                    generated_question=generated_question,
+                    index=index,
+                )
         return maybe_repair_generated_question(
             generated_question,
             with_internal_defaults(checked),

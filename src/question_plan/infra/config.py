@@ -28,6 +28,18 @@ class AppConfig:
     chat_completions_endpoint: str | None
 
 
+def generated_question_reasoning_model(config: AppConfig) -> str:
+    """Model mạnh cho generated question; giữ mapping Qwen ở FALLBACK_JUDGE_MODEL hiện tại."""
+
+    return str(getattr(config, "fallback_judge_model", "") or config.primary_judge_model)
+
+
+def generated_question_fast_model(config: AppConfig) -> str:
+    """Model nhanh cho generated question; giữ mapping Gemma ở PRIMARY_JUDGE_MODEL hiện tại."""
+
+    return str(config.primary_judge_model)
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
