@@ -89,7 +89,7 @@ def generated_result_list(result: dict[str, Any]) -> list[dict[str, Any]]:
     return [result]
 
 
-def generated_report_summary(result: dict[str, Any]) -> dict[str, int]:
+def generated_report_summary(result: dict[str, Any]) -> dict[str, Any]:
     rows = generated_result_list(result)
     status_counts = {"good": 0, "bad": 0, "needs_review": 0, "warning": 0}
     repair_counts = {"repaired": 0, "needs_manual_review": 0, "failed": 0, "skipped": 0}
@@ -98,7 +98,7 @@ def generated_report_summary(result: dict[str, Any]) -> dict[str, int]:
         status_counts[status] = status_counts.get(status, 0) + 1
         repair = generated_repair_status(item)
         repair_counts[repair] = repair_counts.get(repair, 0) + 1
-    return {
+    summary = {
         "total": len(rows),
         "good": status_counts["good"],
         "with_issues": len(rows) - status_counts["good"],
@@ -110,6 +110,8 @@ def generated_report_summary(result: dict[str, Any]) -> dict[str, int]:
         "repair_failed": repair_counts["failed"],
         "skipped": repair_counts["skipped"],
     }
+    summary.update(result.get("summary") or {})
+    return summary
 
 
 def format_generated_question_markdown(result: dict[str, Any], *, source_name: str = "") -> str:
@@ -133,6 +135,16 @@ def format_generated_question_markdown(result: dict[str, Any], *, source_name: s
             "",
         ]
     )
+    if summary.get("judge_gemma_dual_runs") or summary.get("resolver_gemma_dual_runs"):
+        lines[-2:-2] = [
+            "## Định tuyến kiểm tra tính nhất quán của Gemma",
+            "",
+            "| Giai đoạn | Số lượt đánh giá kép | Đồng thuận | Bất đồng | Lượt 1 không hợp lệ | Lượt 2 không hợp lệ | Số lần dùng Qwen | Tỷ lệ đồng thuận | Tỷ lệ dùng Qwen |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"| Đánh giá lời giải | {summary.get('judge_gemma_dual_runs', 0)} | {summary.get('judge_gemma_agreements', 0)} | {summary.get('judge_gemma_disagreements', 0)} | {summary.get('judge_gemma_run_1_invalid', 0)} | {summary.get('judge_gemma_run_2_invalid', 0)} | {summary.get('judge_fallbacks', 0)} | {summary.get('judge_gemma_agreement_rate', 0)} | {summary.get('judge_fallback_rate', 0)} |",
+            f"| Đối chiếu đáp án | {summary.get('resolver_gemma_dual_runs', 0)} | {summary.get('resolver_gemma_agreements', 0)} | {summary.get('resolver_gemma_disagreements', 0)} | {summary.get('resolver_gemma_run_1_invalid', 0)} | {summary.get('resolver_gemma_run_2_invalid', 0)} | {summary.get('resolver_fallbacks', 0)} | {summary.get('resolver_gemma_agreement_rate', 0)} | {summary.get('resolver_fallback_rate', 0)} |",
+            "",
+        ]
     lines.extend(
         [
             "| # | ID | Status | Repair | Issues | Failed Reason | Suggestions |",
@@ -206,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repaired-output", default=None)
     parser.add_argument("--model", default=None, help="Model dùng riêng cho --ping.")
     parser.add_argument("--max-loop", type=int, default=1, help="Số vòng repair/check, clamp 1..3.")
+    parser.add_argument("--workers", type=int, default=2, help="Số generated question xử lý song song; Gemma tối đa 4 call.")
     parser.add_argument("--strict-mode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--auto-repair", action=argparse.BooleanOptionalAction, default=False)
@@ -215,10 +228,10 @@ def build_parser() -> argparse.ArgumentParser:
 def ping_model(client: LLMClient, model: str) -> None:
     response = client.chat_completion(
         model=model,
-        messages=[{"role": "user", "content": "Xin chào, hãy trả lời ngắn gọn bằng tiếng Việt."}],
+        messages=[{"role": "user", "content": "Xin chào"}],
         temperature=0,
     )
-    preview = response["content"].strip().replace("\n", " ")[:200]
+    preview = response["content"].strip().replace("\n", " ")[:1000]
     print(f"[OK] {model} ({response['latency_seconds']}s): {preview}")
 
 
@@ -298,6 +311,7 @@ def main() -> int:
                 progress_callback=print_generated_question_progress,
                 auto_repair=args.auto_repair,
                 max_loop=args.max_loop,
+                workers=args.workers,
             )
             output_path = Path(args.output or "results/generated_question_check_repair_output.json")
             report_path = Path(args.report_output or "results/generated_question_repair_report.md")

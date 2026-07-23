@@ -3,25 +3,37 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from ..infra.config import AppConfig, generated_question_fast_model, generated_question_reasoning_model
+from pydantic import ValidationError
+
+from ..infra.config import (
+    AppConfig,
+    generated_question_fast_model,
+    generated_question_reasoning_model,
+)
 from ..infra.debug import debug_llm_messages, llm_prompt_debug_enabled
 from ..infra.llm_client import LLMClient
 from ..shared.utils import parse_json_output
+from ..schemas.generated_question_contracts import (
+    SolutionSplitOutput,
+    TransitionJudgeOutput,
+    contract_schema_text,
+    validation_error_text,
+)
 from .generated_question_schema import (
     fail_closed_output,
-    generated_question_id,
     normalize_generated_question_result,
 )
 
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
 CRITERIA_PATH = KNOWLEDGE_DIR / "generated_question_quality_criteria.md"
-OUTPUT_SCHEMA_PATH = KNOWLEDGE_DIR / "generated_question_output_schema.md"
 
 
 def load_text(path: Path) -> str:
@@ -72,116 +84,218 @@ def compact_generated_question_payload(
         solutions.append(
             {
                 "index": solution_index,
-                "solverName": solution.get("solverName"),
+                "path": f"/solutions/{solution_index}",
                 "textBlocks": text_blocks,
             }
         )
 
-    return {
+    payload = {
         "id": generated_question.get("id") or generated_question.get("_id") or "",
-        "interactionTypes": generated_question.get("interactionTypes"),
-        "instruction": generated_question.get("instruction"),
         "questionItems": question_items,
         "solutions": solutions,
     }
+    if generated_question.get("instruction"):
+        payload["instruction"] = generated_question["instruction"]
+    return payload
 
 
-def build_generated_question_judge_messages(
+def validate_splitter_output(
+    parsed: Any,
     generated_question: dict[str, Any],
-    criteria_text: str,
-    output_schema_text: str,
-) -> list[dict[str, str]]:
+) -> tuple[dict[str, Any] | None, str]:
+    try:
+        split = SolutionSplitOutput.model_validate(parsed).model_dump()
+    except ValidationError as exc:
+        return None, validation_error_text(exc)
+
     payload = compact_generated_question_payload(generated_question)
-    vietnamese_output_policy = (
-        "Chính sách ngôn ngữ bắt buộc: mọi chuỗi người đọc trong output JSON phải viết bằng tiếng Việt có dấu. "
-        "Áp dụng cho failed_reason, suggestions, issues[].reason, issues[].suggestion và mọi notes nếu có. "
-        "Không dùng câu tiếng Anh. Chỉ giữ nguyên tiếng Anh/ký hiệu khi đó là tên field, enum, id, JSON Pointer, "
-        "code, LaTeX hoặc nội dung trích nguyên văn từ generated question."
-    )
+    sources: dict[str, str] = {}
+    path_ranks: dict[str, tuple[int, int]] = {}
+    for solution in payload.get("solutions") or []:
+        solution_index = int(solution["index"])
+        for block_rank, block in enumerate(solution.get("textBlocks") or []):
+            path = str(block["path"])
+            sources[path] = str(block["text"])
+            path_ranks[path] = (solution_index, block_rank)
+
+    states_by_path: dict[str, list[str]] = {}
+    states_by_solution: dict[int, list[dict[str, Any]]] = {}
+    for state in split["states"]:
+        path = str(state["source_path"])
+        if path not in sources:
+            return None, f"source_path không tồn tại: {path}"
+        expected_solution_index, _block_rank = path_ranks[path]
+        if int(state["solution_index"]) != expected_solution_index:
+            return None, f"solution_index không khớp source_path: {path}"
+        if not state["source_text"]:
+            return None, f"Splitter trả state rỗng tại {path}"
+        states_by_path.setdefault(path, []).append(state["source_text"])
+        states_by_solution.setdefault(expected_solution_index, []).append(state)
+
+    if set(states_by_path) != set(sources):
+        return None, "Splitter đã bỏ qua một hoặc nhiều solution block."
+    for path, source in sources.items():
+        if "".join(states_by_path[path]) != source:
+            return None, f"Splitter đã thêm, bớt hoặc thay đổi ký tự tại {path}"
+
+    for solution_index, states in sorted(states_by_solution.items()):
+        if [state["order"] for state in states] != list(range(len(states))):
+            return None, f"order của solution {solution_index} không liên tục hoặc bị trùng."
+        ranks = [path_ranks[state["source_path"]][1] for state in states]
+        if ranks != sorted(ranks):
+            return None, f"Splitter đã thay đổi thứ tự solution block của solution {solution_index}."
+    return split, ""
+
+
+def build_solution_splitter_messages(generated_question: dict[str, Any]) -> list[dict[str, str]]:
+    payload = compact_generated_question_payload(generated_question)
     return [
         {
             "role": "system",
             "content": (
-                "Bạn là Solution Quality Judge cho generated question. "
-                "Nhiệm vụ duy nhất là đánh giá chất lượng, tính đầy đủ và tính nhất quán nội bộ của solution "
-                "dựa trên instruction, stem và interaction type được cung cấp. "
-                "Không dùng question_plan, raw question, raw answer, PDF, OCR hoặc dữ liệu ngoài payload. "
-                "Không tạo generated question mới và không trực tiếp repair dữ liệu. "
-                "Không tự giải lại toàn bộ bài toán để thiết lập một đáp án chuẩn mới. "
-                "Không tạo final answer mới và không thay đổi answerSpec hoặc options. "
-                "Đây là nhiệm vụ xác minh trung lập, không phải nhiệm vụ cố gắng tìm lỗi; không được giả định solution phải có lỗi. "
-                "Một solution có thể chứa toàn bộ lời giải trong một text block duy nhất. Không giả định mỗi bước nằm trong một object, "
-                "mỗi dòng là một bước hoặc mỗi block có ID riêng. Đọc các textBlocks theo contentIndex tăng dần. "
-                "Trong từng text block, phải tự phân tách nội bộ các đơn vị lời giải theo đúng thứ tự đọc dựa trên ngữ nghĩa, "
-                "có thể nhận biết qua xuống dòng, bullet, số thứ tự, dấu suy ra/ tương đương, chuỗi phương trình hoặc bất đẳng thức "
-                "và các từ nối như Ta có, Suy ra, Do đó, Vậy, Thay vào, Rút gọn, Chia hai vế, Theo giả thiết. "
-                "Các tín hiệu này không phải quy tắc máy móc: phải hiểu nội dung để xác định đơn vị lời giải. "
-                "Việc phân tách chỉ dùng nội bộ trong lần đánh giá này; không trả danh sách step, step index, line index, internal trace "
-                "hoặc chain-of-thought và không thay đổi dữ liệu đầu vào. "
-                "Được phép và bắt buộc sử dụng kiến thức toán học/chuyên môn để thực hiện QUY TRÌNH TUẦN TỰ BẮT BUỘC sau: "
-                "(1) Xem dữ kiện và yêu cầu trong instruction/stem là đơn vị đứng ngay trước đơn vị lời giải đầu tiên, "
-                "rồi áp dụng đầy đủ checklist chuyển tiếp cho instruction/stem → đơn vị đầu tiên. Không yêu cầu solution chép lại đề bài, "
-                "nhưng đơn vị đầu tiên phải trực tiếp suy ra từ dữ kiện, có phép tính chính xác và không gộp quá một phép biến đổi chính. "
-                "Nếu để đi từ đề bài tới đơn vị đầu tiên cần từ hai phép biến đổi chính độc lập trở lên thì báo thiếu bước trung gian. "
-                "Câu hỏi nhận biết trực tiếp không bị yêu cầu thêm bước trung gian khi thực tế không có phép biến đổi cần trình bày. "
-                "(2) Với mỗi đơn vị lời giải tiếp theo, chỉ bắt đầu sau khi đơn vị trước đã được xác nhận hợp lệ và phải tự trả lời nội bộ theo đúng thứ tự: "
-                "Thứ nhất, tính lại các phép toán hoặc quan hệ xuất hiện trong đơn vị mới. "
-                "Thứ hai, xác nhận đơn vị mới có thực sự suy ra từ đúng đơn vị ngay trước hay không; không dùng final answer hoặc bước phía sau để hợp thức hóa. "
-                "Thứ ba, xác định chuyển tiếp cần bao nhiêu phép biến đổi chính. "
-                "Phép biến đổi tương đương không thay đổi tập nghiệm, gồm: chuyển vế đổi dấu (là cách viết tắt của cộng hoặc trừ cùng một biểu thức ở hai vế); "
-                "cộng hoặc trừ cùng một biểu thức xác định; nhân hoặc chia hai vế cho cùng một hằng số khác 0; "
-                "áp dụng lũy thừa bậc lẻ hoặc căn bậc lẻ tương ứng trên miền số thực. "
-                "Phép biến đổi có nguy cơ thay đổi tập nghiệm gồm: lũy thừa bậc chẵn; nhân hoặc chia với biểu thức chứa ẩn; "
-                "và phép biến đổi có điều kiện xác định như căn, logarit hoặc lượng giác. Với nhóm này phải giữ điều kiện cần thiết và kiểm tra nghiệm ngoại lai hoặc nghiệm bị mất. "
-                "Mỗi lần áp dụng một phép biến đổi độc lập được tính là một phép biến đổi chính; các cách diễn đạt tương đương của cùng một thao tác không được đếm lặp. "
-                "Chỉ chấp nhận tối đa một phép biến đổi chính trong mỗi chuyển tiếp. "
-                "Các phép tính trực tiếp, rút gọn hệ số, chuẩn hóa ký hiệu hoặc viết lại tương đương trực tiếp trong chính phép biến đổi đó là thao tác vi mô. "
-                "Thứ tư, nếu phép tính sai, quan hệ không suy ra được hoặc cần từ hai phép biến đổi chính độc lập trở lên thì "
-                "DỪNG TOÀN BỘ kiểm tra toán học, chỉ tạo một issue cho chuyển tiếp đầu tiên này, không phân tích bước phía sau và không nhận xét final answer. "
-                "Thứ năm, chỉ khi chuyển tiếp đúng mới đánh giá cách trình bày có đủ rõ để người học hiểu vì sao đơn vị mới suy ra từ đơn vị trước hay không. "
-                "Với bài lập luận, bước xác nhận phải kiểm tra đúng quan hệ/quy tắc cùng đầy đủ tiền đề và điều kiện cần thiết. "
-                "(3) Chỉ khi toàn bộ các chuyển tiếp đã hợp lệ mới kiểm tra thiếu nhánh nghiệm, điều kiện, trường hợp quan trọng, "
-                "thiếu quá trình cần thiết, dài dòng, lặp ý, thử-sai, tự vấn hoặc đoạn nháp. "
-                "(4) Trước khi trả issue, kiểm tra lại chính nhận định lỗi một lần; nếu nhận định không đứng vững thì hủy hoàn toàn issue đã dự kiến. "
-                "Reason phải nhất quán và chỉ mô tả lỗi đầu tiên, không được đồng thời nói cùng một nội dung vừa sai vừa đúng. "
-                "Nếu tất cả bước đều hợp lệ thì trả is_good=true và issues=[]. "
-                "Nếu solution phụ thuộc bảng, hình, sơ đồ hoặc đồ thị nhưng dữ liệu cần thiết không có trong instruction/stem, "
-                "không tự tưởng tượng dữ liệu và phải trả solution_quality/needs_manual_review. "
-                "Không đánh giá answerSpec, option hoặc hint trong bước này. "
-                f"{vietnamese_output_policy}"
+                "Bạn là Solution State Splitter. Chỉ chia text thành ordered states, không đánh giá đúng sai. "
+                "Tuyệt đối không thêm, bớt, sửa, chuẩn hóa hoặc diễn giải bất kỳ chữ, khoảng trắng, xuống dòng, "
+                "dấu câu, ký hiệu hay LaTeX nào. Chỉ trả một JSON object hợp lệ, không markdown."
             ),
         },
         {
             "role": "user",
             "content": (
-                "Hãy chỉ đánh giá solution theo criteria và output schema bên dưới.\n\n"
-                "Yêu cầu bắt buộc:\n"
-                "- Chỉ dùng SOLUTION QUALITY PAYLOAD.\n"
-                "- Không hard-code theo id/_id/aiId cụ thể.\n"
-                "- Không so sánh với question_plan hoặc source/raw question/raw answer.\n"
-                f"- {vietnamese_output_policy}\n"
-                "- Chỉ tạo category solution_quality.\n"
-                "- Chỉ dùng clean_solution_reasoning cho lỗi trình bày có thể làm sạch mà không đổi logic toán học hoặc final answer.\n"
-                "- Dùng severity needs_review và repair_intent needs_manual_review cho phép tính/biến đổi sai, thiếu bước chính, "
-                "thiếu nhánh/điều kiện, chỉ nêu đáp án, thiếu dữ liệu ngoài JSON hoặc solution không đủ để kiểm chứng.\n"
-                "- Không tự repair lỗi toán học và không đề xuất final answer mới.\n"
-                "- Solution có thể có nhiều bước trong cùng một text; phải tự phân đoạn nội bộ, không coi mỗi object là một bước và không dựa vào block ID.\n"
-                "- Đọc các textBlocks theo contentIndex rồi đọc nội dung mỗi block theo thứ tự xuất hiện. Chỉ kiểm tra chuyển tiếp sau khi chuyển tiếp trước đã hợp lệ.\n"
-                "- Khi gặp lỗi toán học đầu tiên, chỉ trả một issue cho solution đó; không bỏ qua lỗi trước để chọn lỗi nổi bật hơn phía sau.\n"
-                "- location và required_context_paths phải dùng path thật của textBlocks trong payload, trỏ tới text block gốc chứa chuyển tiếp sai. "
-                "Không tạo path step/line/statement không tồn tại.\n"
-                "- Reason phải mô tả rõ đơn vị trước, đơn vị sai và phép tính hoặc quan hệ đúng chứng minh lỗi; không trả step index, line index, "
-                "internal trace, chain-of-thought hoặc danh sách bước đã tách.\n"
-                "- Chỉ trả JSON object hợp lệ, không markdown, không giải thích ngoài JSON.\n"
-                "QUALITY CRITERIA:\n"
-                f"{criteria_text}\n\n"
-                "OUTPUT SCHEMA:\n"
-                f"{output_schema_text}\n\n"
-                "SOLUTION QUALITY PAYLOAD:\n"
-                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                "Chỉ trả field states. Mỗi source_text phải là một lát cắt nguyên văn của đúng source_path. "
+                "Trong từng solution, order bắt đầu từ 0 và liên tục qua các text block theo thứ tự gốc. "
+                "Khi ghép source_text của các state thuộc cùng source_path theo order, kết quả phải giống tuyệt đối "
+                "text gốc từng ký tự. Không trả transitions và không bỏ qua solution block.\n\n"
+                f"JSON SCHEMA:\n{contract_schema_text(SolutionSplitOutput)}\n\n"
+                f"SOLUTION PAYLOAD:\n{json.dumps(payload.get('solutions') or [], ensure_ascii=False, indent=2)}"
             ),
         },
     ]
+
+
+def _problem_anchor(payload: dict[str, Any]) -> dict[str, str] | None:
+    candidates: list[dict[str, str]] = []
+    for index, block in enumerate(payload.get("instruction") or []):
+        if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"].strip():
+            candidates.append({"source_path": f"/instruction/{index}/text", "source_text": block["text"].strip()})
+    for item in payload.get("questionItems") or []:
+        item_index = int(item["index"])
+        for block_index, block in enumerate(item.get("stem") or []):
+            if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"].strip():
+                candidates.append({
+                    "source_path": f"/questionItems/{item_index}/stem/{block_index}/text",
+                    "source_text": block["text"].strip(),
+                })
+    return max(
+        candidates,
+        key=lambda item: (item["source_text"].count("="), len(item["source_text"])),
+        default=None,
+    )
+
+
+def _prepend_problem_context(
+    split: dict[str, Any],
+    generated_question: dict[str, Any],
+) -> dict[str, Any]:
+    anchor = _problem_anchor(compact_generated_question_payload(generated_question))
+    if anchor is None:
+        return split
+    states: list[dict[str, Any]] = []
+    solution_indexes = sorted({int(state["solution_index"]) for state in split["states"]})
+    for solution_index in solution_indexes:
+        solution_states = [state for state in split["states"] if int(state["solution_index"]) == solution_index]
+        states.append({"solution_index": solution_index, "order": 0, **anchor})
+        states.extend({**state, "order": int(state["order"]) + 1} for state in solution_states)
+    return {"states": states}
+
+
+def build_generated_question_judge_messages(
+    generated_question: dict[str, Any],
+    criteria_text: str,
+    ordered_solution: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Yêu cầu LLM tự đánh giá và chỉ trả kết luận good/bad/uncertain."""
+
+    payload = compact_generated_question_payload(generated_question)
+    payload.pop("solutions", None)
+    stages = build_transition_stages(ordered_solution)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Bạn là Solution Quality Judge chuyên nghiệp. Nhiệm vụ của bạn là đánh giá tính đúng đắn "
+                "và chất lượng của lời giải toán học dựa trên `question_context` và các `stages_co_dinh`.\n\n"
+                "<cac_rang_buoc_bat_buoc>\n"
+                "- CHỈ đánh giá solution; dùng instruction, stem và interaction type làm ngữ cảnh nền.\n"
+                "- TUYỆT ĐỐI KHÔNG đánh giá answerSpec, expected, options hoặc hints.\n"
+                "- KHÔNG sửa solution đầu vào hoặc tạo final answer mới.\n"
+                "- CHỈ trả duy nhất một JSON object đúng schema; không markdown, không preamble.\n"
+                '- Toàn bộ "reason" và "suggestion" PHẢI viết bằng tiếng Việt.\n'
+                "</cac_rang_buoc_bat_buoc>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"<huong_dan_danh_gia>\n{criteria_text}\n</huong_dan_danh_gia>\n\n"
+                "<vi_du_kiem_tra_loi>\n"
+                "Ví dụ 1 — lỗi tính toán xuất hiện trước:\n"
+                "2x^3 + 3 = 19 → 2x^3 = 18 → x^3 = 9 → x = 2\n"
+                "Kết luận: bad tại transition đầu tiên, vì 19 - 3 = 16, không phải 18. "
+                "Không được bỏ qua để báo lỗi phía sau.\n\n"
+                "Ví dụ 2 — thiếu bước biến đổi cốt lõi:\n"
+                "2x^3 + 3 = 19 → 2x^3 = 16 → x = 2\n"
+                "Kết luận: bad tại transition thứ hai, vì thiếu trạng thái trung gian x^3 = 8.\n"
+                "</vi_du_kiem_tra_loi>\n\n"
+                f"<question_context>\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n</question_context>\n\n"
+                f"<stages_co_dinh>\n{json.dumps(stages, ensure_ascii=False, indent=2)}\n</stages_co_dinh>\n\n"
+                "<output_schema_json>\n"
+                f"{contract_schema_text(TransitionJudgeOutput)}\n"
+                "</output_schema_json>\n\n"
+                "<rang_buoc_cuoi>\n"
+                "- Không chia lại stage và không sửa các trường dữ liệu của stage.\n"
+                "- Điền kết quả kiểm tra từ stage 1 theo đúng thứ tự.\n"
+                "- Gặp trang_thai_buoc=false đầu tiên thì trả stage đó và dừng.\n"
+                "- Không dùng đáp án cuối đúng để hợp thức hóa transition sai.\n"
+                "- Không thêm, sửa hoặc đổi solution_index/order.\n"
+                "- Chỉ trả JSON đúng schema.\n"
+                "</rang_buoc_cuoi>"
+            ),
+        },
+    ]
+
+
+def build_transition_stages(ordered_solution: dict[str, Any]) -> dict[str, Any]:
+    """Ghép các state liền kề thành stage cố định để Judge chỉ việc kiểm tra."""
+
+    stages: list[dict[str, Any]] = []
+    solution_indexes = sorted({int(state["solution_index"]) for state in ordered_solution.get("states") or []})
+    for solution_index in solution_indexes:
+        states = sorted(
+            (
+                state
+                for state in ordered_solution.get("states") or []
+                if int(state["solution_index"]) == solution_index
+            ),
+            key=lambda state: int(state["order"]),
+        )
+        if not states:
+            continue
+        stages.append({
+            "solution_index": solution_index,
+            "stage": 0,
+            "source_path": states[0]["source_path"],
+            "noi_dung": states[0]["source_text"],
+        })
+        for previous, current in zip(states, states[1:]):
+            stages.append({
+                "solution_index": solution_index,
+                "stage": int(current["order"]),
+                "from_order": int(previous["order"]),
+                "to_order": int(current["order"]),
+                "bieu_thuc_truoc": previous["source_text"],
+                "bieu_thuc_sau": current["source_text"],
+            })
+    return {"stages": stages}
 
 
 def debug_generated_question_call(
@@ -217,94 +331,124 @@ def debug_generated_question_call(
     print("[DEBUG_GENERATED_QUESTION_JUDGE] " + json.dumps(payload, ensure_ascii=False), file=sys.stderr)
 
 
-def normalize_llm_response(
-    *,
-    response: dict[str, Any] | None,
-    strict_mode: bool,
-    generated_question: dict[str, Any],
-    index: int = 0,
-    error: str = "",
-) -> dict[str, Any]:
-    if error:
-        return fail_closed_output(error, generated_question=generated_question, index=index)
-    content = str((response or {}).get("content") or "")
-    parsed, parse_ok, parse_error = parse_json_output(content)
-    if not parse_ok or parsed is None:
-        return fail_closed_output(
-            parse_error or "LLM output không parse được thành JSON.",
-            generated_question=generated_question,
-            index=index,
+def validate_transition_judge_output(
+    parsed: Any,
+    ordered_solution: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    """Chỉ kiểm tra contract và vị trí transition do LLM kết luận."""
+
+    try:
+        output = TransitionJudgeOutput.model_validate(parsed).model_dump()
+    except ValidationError as exc:
+        return None, validation_error_text(exc)
+
+    expected: list[tuple[int, int, int]] = []
+    solution_indexes = sorted({int(state["solution_index"]) for state in ordered_solution.get("states") or []})
+    for solution_index in solution_indexes:
+        states = [
+            state
+            for state in ordered_solution.get("states") or []
+            if int(state["solution_index"]) == solution_index
+        ]
+        expected.extend(
+            (solution_index, order, order + 1)
+            for order in range(len(states) - 1)
         )
-    parsed.setdefault("id", generated_question_id(generated_question, index))
-    parsed["issues"] = [
-        issue
-        for issue in parsed.get("issues") or []
-        if isinstance(issue, dict) and issue.get("category") == "solution_quality"
-    ]
-    for issue in parsed["issues"]:
-        intent = str(issue.get("repair_intent") or "")
-        if intent not in {"clean_solution_reasoning", "needs_manual_review"}:
-            issue["repair_intent"] = "needs_manual_review"
-        if issue.get("repair_intent") == "needs_manual_review":
-            issue["severity"] = "needs_review"
-        else:
-            issue["severity"] = "warning"
-    first_blocking_by_solution: set[str] = set()
-    retained_issues = []
-    for issue in parsed["issues"]:
-        location_parts = str(issue.get("location") or "").split("/")
-        solution_owner = (
-            location_parts[2]
-            if len(location_parts) > 2
-            and location_parts[0] == ""
-            and location_parts[1] == "solutions"
-            and location_parts[2].isdigit()
-            else None
+    verdict = output["verdict"]
+    stage_results = output["stage_results"]
+    if len(stage_results) > len(expected):
+        return None, "Judge trả nhiều stage hơn input."
+    for position, stage_result in enumerate(stage_results):
+        key = (
+            stage_result["solution_index"],
+            stage_result["from_order"],
+            stage_result["to_order"],
         )
-        if solution_owner in first_blocking_by_solution:
-            continue
-        retained_issues.append(issue)
-        if solution_owner is not None and issue.get("repair_intent") == "needs_manual_review":
-            first_blocking_by_solution.add(solution_owner)
-    parsed["issues"] = retained_issues
-    return normalize_generated_question_result(
-        parsed,
-        strict_mode=strict_mode,
-        generated_question=generated_question,
-        index=index,
-    )
+        if key != expected[position] or stage_result["stage"] != stage_result["to_order"]:
+            return None, "stage_result không đúng thứ tự hoặc không trỏ tới hai state liền kề."
+        if not stage_result["kiem_tra_lap_luan"].strip():
+            return None, "Mỗi stage_result phải có kiem_tra_lap_luan."
+
+    failed = [position for position, item in enumerate(stage_results) if not item["trang_thai_buoc"]]
+    if len(failed) > 1 or (failed and failed[0] != len(stage_results) - 1):
+        return None, "Judge phải dừng ngay sau stage có trang_thai_buoc=false."
+    if not failed and len(stage_results) != len(expected):
+        return None, "Judge chưa kiểm tra đủ các stage theo thứ tự."
+
+    if verdict == "good":
+        if failed:
+            return None, "Kết luận good không được có stage sai."
+        output["reason"] = ""
+        output["suggestion"] = ""
+        output["first_invalid_transition"] = None
+        return output, ""
+    if not output["reason"].strip() or not output["suggestion"].strip():
+        return None, "Kết luận bad/uncertain phải có reason và suggestion."
+    if failed:
+        failed_stage = stage_results[failed[0]]
+        if not failed_stage["reason"].strip():
+            return None, "Stage sai phải có reason."
+        output["first_invalid_transition"] = {
+            "solution_index": failed_stage["solution_index"],
+            "from_order": failed_stage["from_order"],
+            "to_order": failed_stage["to_order"],
+        }
+    else:
+        output["first_invalid_transition"] = None
+    return output, ""
 
 
-def call_generated_question_judge(
-    *,
+def _call_solution_splitter(
     generated_question: dict[str, Any],
-    schema_validation_result: dict[str, Any],
-    config: AppConfig,
     client: LLMClient,
     model: str,
-    strict_mode: bool,
-    index: int = 0,
-    debug: bool = False,
+    *,
+    debug: bool,
+) -> tuple[dict[str, Any] | None, str]:
+    messages = build_solution_splitter_messages(generated_question)
+    try:
+        debug_llm_messages(step="solution_state_splitter", model=model, messages=messages, debug=debug)
+        response = client.chat_completion(model=model, messages=messages, temperature=0)
+    except Exception as exc:
+        return None, str(exc)
+    content = str(response.get("content") or "")
+    fenced_candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.IGNORECASE | re.DOTALL)
+    candidates = list(reversed(fenced_candidates)) if fenced_candidates else [content]
+    last_error = "Splitter không trả JSON hợp lệ."
+    for candidate in candidates:
+        parsed, parse_ok, parse_error = parse_json_output(candidate)
+        if not parse_ok or parsed is None:
+            last_error = parse_error or last_error
+            continue
+        split, error = validate_splitter_output(parsed, generated_question)
+        if split is not None:
+            return split, ""
+        last_error = error
+    return None, last_error
+
+
+def _call_transition_judge(
+    *,
+    generated_question: dict[str, Any],
+    ordered_solution: dict[str, Any],
+    schema_validation_result: dict[str, Any],
+    client: LLMClient,
+    model: str,
+    debug: bool,
 ) -> dict[str, Any]:
-    criteria_text = load_text(CRITERIA_PATH)
-    output_schema_text = load_text(OUTPUT_SCHEMA_PATH)
     messages = build_generated_question_judge_messages(
         generated_question,
-        criteria_text,
-        output_schema_text,
+        load_text(CRITERIA_PATH),
+        ordered_solution,
     )
     prompt_chars = sum(len(message.get("content") or "") for message in messages)
     start = time.perf_counter()
     try:
-        debug_llm_messages(step="generated_question_judge", model=model, messages=messages, debug=debug)
-        response = client.chat_completion(
-            model=model,
-            messages=messages,
-            temperature=0,
-        )
+        debug_llm_messages(step="solution_transition_judge", model=model, messages=messages, debug=debug)
+        response = client.chat_completion(model=model, messages=messages, temperature=0)
         elapsed = float(response.get("latency_seconds") or (time.perf_counter() - start))
         debug_generated_question_call(
-            step="generated_question_judge",
+            step="solution_transition_judge",
             model=model,
             generated_question=generated_question,
             schema_validation_result=schema_validation_result,
@@ -312,30 +456,187 @@ def call_generated_question_judge(
             elapsed_seconds=elapsed,
             debug=debug,
         )
-        return normalize_llm_response(
-            response=response,
-            strict_mode=strict_mode,
-            generated_question=generated_question,
-            index=index,
-        )
+        content = str(response.get("content") or "")
+        fenced_candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.IGNORECASE | re.DOTALL)
+        candidates = list(reversed(fenced_candidates)) if fenced_candidates else [content]
+        last_error = "Gemma không trả JSON hợp lệ."
+        for candidate in candidates:
+            parsed, parse_ok, parse_error = parse_json_output(candidate)
+            if not parse_ok or parsed is None:
+                last_error = parse_error or last_error
+                continue
+            output, error = validate_transition_judge_output(parsed, ordered_solution)
+            if output is not None:
+                return {"contract_valid": True, **output}
+            last_error = error
+        return {"contract_valid": False, "contract_error": last_error}
     except Exception as exc:
-        elapsed = time.perf_counter() - start
         debug_generated_question_call(
-            step="generated_question_judge_error",
+            step="solution_transition_judge_error",
             model=model,
             generated_question=generated_question,
             schema_validation_result=schema_validation_result,
             prompt_chars=prompt_chars,
-            elapsed_seconds=elapsed,
+            elapsed_seconds=time.perf_counter() - start,
             debug=debug,
         )
-        return normalize_llm_response(
-            response=None,
-            strict_mode=strict_mode,
+        return {"contract_valid": False, "contract_error": str(exc)}
+
+
+def _first_transition_problem(result: dict[str, Any]) -> dict[str, Any] | None:
+    if result.get("verdict") == "good":
+        return None
+    transition = result.get("first_invalid_transition")
+    return {**transition, "verdict": result["verdict"]} if transition else None
+
+
+def _transition_issue(
+    judge_result: dict[str, Any],
+    ordered_solution: dict[str, Any],
+) -> dict[str, Any]:
+    transition = judge_result.get("first_invalid_transition")
+    state = next(
+        (
+            state
+            for state in ordered_solution["states"]
+            if transition
+            and state["solution_index"] == transition["solution_index"]
+            and state["order"] == transition["to_order"]
+        ),
+        None,
+    )
+    return {
+        "severity": "needs_review",
+        "category": "solution_quality",
+        "location": state["source_path"] if state else "/solutions",
+        "reason": judge_result["reason"],
+        "suggestion": judge_result["suggestion"],
+        "repair_intent": "needs_manual_review",
+    }
+
+
+def _single_transition_judge_result(
+    judge_result: dict[str, Any],
+    ordered_solution: dict[str, Any],
+    generated_question: dict[str, Any],
+    *,
+    strict_mode: bool,
+    index: int,
+) -> dict[str, Any]:
+    """Chuyển một output Qwen hợp lệ về result hiện tại mà không lộ contract nội bộ."""
+
+    problem = _first_transition_problem(judge_result)
+    is_good = judge_result["verdict"] == "good"
+    payload = {
+        "is_good": is_good,
+        "issues": [] if is_good else [_transition_issue(judge_result, ordered_solution)],
+    }
+    selected = (
+        {"from_order": problem["from_order"], "to_order": problem["to_order"]}
+        if problem
+        else None
+    )
+    result = normalize_generated_question_result(
+        payload,
+        strict_mode=strict_mode,
+        generated_question=generated_question,
+        index=index,
+    )
+    result["_judge_transition_decision"] = {
+        "decision_source": "qwen_fallback",
+        "confirmed_by_both": False,
+        "selected_transition": selected,
+    }
+    return result
+
+
+def aggregate_transition_judge_results(
+    results: list[dict[str, Any]],
+    ordered_solution: dict[str, Any],
+    generated_question: dict[str, Any],
+    *,
+    strict_mode: bool,
+    index: int,
+) -> dict[str, Any]:
+    valid_results = [result for result in results if result.get("contract_valid")]
+    decision_source = "contract_failure"
+    confirmed_by_both = False
+    selected: dict[str, Any] | None = None
+
+    if not valid_results:
+        result = fail_closed_output(
+            "Cả hai Gemma trả output transition không đúng contract.",
             generated_question=generated_question,
             index=index,
-            error=str(exc),
         )
+    elif len(valid_results) == 1:
+        judge_result = valid_results[0]
+        problem = _first_transition_problem(judge_result)
+        if judge_result["verdict"] == "good":
+            result = fail_closed_output(
+                "Một Gemma sai contract; kết quả Gemma còn lại không đủ để xác nhận lời giải đúng.",
+                generated_question=generated_question,
+                index=index,
+            )
+        else:
+            selected = problem
+            result = normalize_generated_question_result(
+                {"is_good": False, "issues": [_transition_issue(judge_result, ordered_solution)]},
+                strict_mode=strict_mode,
+                generated_question=generated_question,
+                index=index,
+            )
+    else:
+        non_good = [item for item in valid_results if item["verdict"] != "good"]
+        if non_good:
+            with_transition = [
+                (item, problem)
+                for item in non_good
+                if (problem := _first_transition_problem(item)) is not None
+            ]
+            if with_transition:
+                selected_result, selected = min(
+                    with_transition,
+                    key=lambda pair: (pair[1]["to_order"], pair[1]["solution_index"]),
+                )
+            else:
+                selected_result = non_good[0]
+            same_transition = len(non_good) == 2 and all(
+                item.get("first_invalid_transition")
+                == selected_result.get("first_invalid_transition")
+                for item in non_good
+            )
+            confirmed_by_both = (
+                same_transition
+                and all(item["verdict"] == "bad" for item in non_good)
+            )
+            decision_source = "gemma_agreement" if confirmed_by_both else "gemma_disagreement"
+            result = normalize_generated_question_result(
+                {"is_good": False, "issues": [_transition_issue(selected_result, ordered_solution)]},
+                strict_mode=strict_mode,
+                generated_question=generated_question,
+                index=index,
+            )
+        else:
+            decision_source = "gemma_agreement"
+            confirmed_by_both = True
+            result = normalize_generated_question_result(
+                {"is_good": True, "issues": []},
+                strict_mode=strict_mode,
+                generated_question=generated_question,
+                index=index,
+            )
+
+    result["_judge_transition_decision"] = {
+        "decision_source": decision_source,
+        "confirmed_by_both": confirmed_by_both,
+        "selected_transition": (
+            {"from_order": selected["from_order"], "to_order": selected["to_order"]}
+            if selected
+            else None
+        ),
+    }
+    return result
 
 
 def judge_generated_question_object(
@@ -348,30 +649,108 @@ def judge_generated_question_object(
     index: int = 0,
     debug: bool = False,
 ) -> dict[str, Any]:
+    """Solution Judge: Gemma/Qwen split, rồi hai Gemma Judge chạy độc lập."""
+
+    fast_model = generated_question_fast_model(config)
     reasoning_model = generated_question_reasoning_model(config)
-    primary = call_generated_question_judge(
-        generated_question=generated_question,
-        schema_validation_result=schema_validation_result,
-        config=config,
-        client=client,
-        model=reasoning_model,
-        strict_mode=strict_mode,
-        index=index,
+    split, gemma_split_error = _call_solution_splitter(
+        generated_question,
+        client,
+        fast_model,
         debug=debug,
     )
-    if primary.get("issues") and any(issue.get("category") == "runtime" for issue in primary["issues"]):
-        fallback_model = generated_question_fast_model(config)
-        if config.use_fallback_judge and fallback_model and fallback_model != reasoning_model:
-            fallback = call_generated_question_judge(
-                generated_question=generated_question,
-                schema_validation_result=schema_validation_result,
-                config=config,
-                client=client,
-                model=fallback_model,
-                strict_mode=strict_mode,
-                index=index,
+    splitter_attempts = 1
+    splitter_fallback_called = False
+    if split is None:
+        split_error = gemma_split_error
+        if (
+            getattr(config, "use_fallback_judge", True)
+            and reasoning_model
+            and reasoning_model != fast_model
+        ):
+            splitter_fallback_called = True
+            splitter_attempts += 1
+            split, split_error = _call_solution_splitter(
+                generated_question,
+                client,
+                reasoning_model,
                 debug=debug,
             )
-            if not any(issue.get("category") == "runtime" for issue in fallback.get("issues") or []):
-                return fallback
-    return primary
+        if split is None:
+            result = fail_closed_output(
+                "Không tách được ordered states nguyên văn: " + split_error,
+                generated_question=generated_question,
+                index=index,
+            )
+            result.update(
+                judge_model=reasoning_model if splitter_fallback_called else fast_model,
+                judge_attempt_count=splitter_attempts,
+                judge_fallback_called=splitter_fallback_called,
+                judge_gemma_run_count=0,
+                judge_gemma_agreement=None,
+                judge_fallback_reason="splitter_contract_failure",
+            )
+            return result
+
+    ordered_solution = _prepend_problem_context(split, generated_question)
+
+    def call_gemma() -> dict[str, Any]:
+        return _call_transition_judge(
+            generated_question=generated_question,
+            ordered_solution=ordered_solution,
+            schema_validation_result=schema_validation_result,
+            client=client,
+            model=fast_model,
+            debug=debug,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gemma_results = [future.result() for future in [executor.submit(call_gemma) for _ in range(2)]]
+    gemma_contract_failure = any(not item.get("contract_valid") for item in gemma_results)
+    qwen_judge_called = False
+    qwen_result: dict[str, Any] | None = None
+    if (
+        gemma_contract_failure
+        and getattr(config, "use_fallback_judge", True)
+        and reasoning_model
+        and reasoning_model != fast_model
+    ):
+        qwen_judge_called = True
+        qwen_result = _call_transition_judge(
+            generated_question=generated_question,
+            ordered_solution=ordered_solution,
+            schema_validation_result=schema_validation_result,
+            client=client,
+            model=reasoning_model,
+            debug=debug,
+        )
+    if qwen_result and qwen_result.get("contract_valid"):
+        result = _single_transition_judge_result(
+            qwen_result,
+            ordered_solution,
+            generated_question,
+            strict_mode=strict_mode,
+            index=index,
+        )
+    else:
+        result = aggregate_transition_judge_results(
+            gemma_results,
+            ordered_solution,
+            generated_question,
+            strict_mode=strict_mode,
+            index=index,
+        )
+    decision = result["_judge_transition_decision"]
+    result.update(
+        judge_model=reasoning_model if qwen_judge_called else fast_model,
+        judge_attempt_count=splitter_attempts + 2 + int(qwen_judge_called),
+        judge_fallback_called=splitter_fallback_called or qwen_judge_called,
+        judge_gemma_run_count=2,
+        judge_gemma_agreement=decision["decision_source"] == "gemma_agreement",
+        judge_fallback_reason=(
+            "gemma_contract_failure"
+            if qwen_judge_called
+            else "gemma_splitter_contract_failure" if splitter_fallback_called else None
+        ),
+    )
+    return result

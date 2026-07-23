@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from ..infra.config import AppConfig, load_config
+from ..infra.config import AppConfig, generated_question_gemma_concurrency, generated_question_gemma_runs, load_config
 from ..infra.debug import llm_prompt_debug_enabled
 from ..infra.llm_client import LLMClient
 from ..logic.generated_question_judge import judge_generated_question_object
@@ -29,11 +30,24 @@ from ..logic.generated_question_schema import (
     validate_input_record,
 )
 from ..logic.generated_question_spelling import check_spelling_and_wording, extract_text_nodes_for_spelling
-from ..logic.solution_anchor_resolver import resolve_solution_anchor_consistency
+from ..logic.solution_anchor_resolver import compact_generated_question_for_solution_anchor, resolve_solution_anchor_consistency
 
 
 SERVICE_ROOT_DIR = Path(__file__).resolve().parents[3]
 GeneratedQuestionProgressCallback = Callable[[int, int, dict[str, Any]], None]
+MAX_GENERATED_QUESTION_WORKERS = 4
+JUDGE_ROUTING_FIELDS = (
+    "judge_model",
+    "judge_attempt_count",
+    "judge_fallback_called",
+    "judge_gemma_run_count",
+    "judge_gemma_agreement",
+    "judge_fallback_reason",
+)
+
+
+def clamp_generated_question_workers(workers: int) -> int:
+    return max(1, min(int(workers), MAX_GENERATED_QUESTION_WORKERS))
 
 
 def default_config() -> AppConfig:
@@ -117,6 +131,11 @@ def compact_solution_anchor_result(anchor: dict[str, Any]) -> dict[str, Any]:
     compact_anchor: dict[str, Any] = {
         "resolver_status": anchor.get("resolver_status"),
         "answerSpec_matches_solution": anchor.get("answerSpec_matches_solution"),
+        "resolver_model": anchor.get("resolver_model"),
+        "fallback_called": bool(anchor.get("resolver_fallback_called", False)),
+        "gemma_run_count": anchor.get("resolver_gemma_run_count"),
+        "gemma_agreement": anchor.get("resolver_gemma_agreement"),
+        "fallback_reason": anchor.get("resolver_fallback_reason"),
     }
     if compact_answer:
         compact_anchor["final_answer"] = compact_answer
@@ -194,6 +213,9 @@ def merge_anchor_result(
         generated_question=generated_question,
         index=index,
     )
+    for key in JUDGE_ROUTING_FIELDS:
+        if key in base_result:
+            merged[key] = base_result[key]
     merged["solution_anchor_result"] = anchor_result
     return merged
 
@@ -217,6 +239,22 @@ def select_solution_quality_gate_issue(result: dict[str, Any]) -> dict[str, Any]
     return next(
         (issue for issue in issues if issue.get("repair_intent") == "needs_manual_review"),
         next((issue for issue in issues if issue.get("repair_intent") == "clean_solution_reasoning"), None),
+    )
+
+
+def select_pre_resolver_blocker(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Block semantic alignment until solution quality was checked successfully."""
+
+    solution_issue = select_solution_quality_gate_issue(result)
+    if solution_issue:
+        return solution_issue
+    return next(
+        (
+            issue
+            for issue in result.get("issues") or []
+            if isinstance(issue, dict) and issue.get("category") == "runtime"
+        ),
+        None,
     )
 
 
@@ -264,9 +302,9 @@ def validate_repaired_text(
 
 
 def select_repair_issue(check_result: dict[str, Any]) -> dict[str, Any] | None:
-    solution_issue = select_solution_quality_gate_issue(check_result)
-    if solution_issue:
-        return solution_issue
+    blocker = select_pre_resolver_blocker(check_result)
+    if blocker:
+        return blocker
     issues = [issue for issue in check_result.get("issues") or [] if isinstance(issue, dict)]
     ordered = sorted(issues, key=issue_sort_key)
     repairable = {
@@ -301,6 +339,23 @@ def repair_once(
     debug: bool,
 ) -> dict[str, Any]:
     solution_issue = select_solution_quality_gate_issue(check_result)
+    runtime_blocker = next(
+        (
+            issue
+            for issue in check_result.get("issues") or []
+            if isinstance(issue, dict) and issue.get("category") == "runtime"
+        ),
+        None,
+    )
+    if runtime_blocker:
+        return {
+            "repair_status": "needs_manual_review",
+            "failed_reason": ["Chưa xác minh được chất lượng solution do lỗi runtime/LLM."],
+            "suggestions": ["Chạy lại Solution Quality Judge hoặc review thủ công trước khi repair."],
+            "new_generated_question": None,
+            "patches": [],
+            "selected_issue": compact_selected_issue(runtime_blocker),
+        }
     if solution_issue and solution_issue.get("repair_intent") != "clean_solution_reasoning":
         return {
             "repair_status": "needs_manual_review",
@@ -506,7 +561,12 @@ def evaluate_generated_question_object(
                 generated_question=generated_question,
                 index=index,
             )
-            if not solution_quality_gate_issues(checked):
+            for key in JUDGE_ROUTING_FIELDS:
+                checked[key] = judge_result.get(key)
+            if (
+                not select_pre_resolver_blocker(checked)
+                and compact_generated_question_for_solution_anchor(generated_question)["interaction_contexts"]
+            ):
                 anchor = resolve_solution_anchor_consistency(
                     generated_question,
                     config=config,
@@ -561,6 +621,7 @@ def evaluate_generated_questions(
     progress_callback: GeneratedQuestionProgressCallback | None = None,
     auto_repair: bool = False,
     max_loop: int = 1,
+    workers: int = 1,
 ) -> dict[str, Any]:
     input_issues = validate_input_record(payload)
     if input_issues:
@@ -576,22 +637,32 @@ def evaluate_generated_questions(
         return public_generated_question_output(with_internal_defaults(failed), debug=debug)
 
     debug_generated_question_batch(generated_questions, debug=debug)
-    results: list[dict[str, Any]] = []
-    for index, generated_question in enumerate(generated_questions):
+    def evaluate_one(index: int, generated_question: dict[str, Any]) -> dict[str, Any]:
         if progress_callback:
             progress_callback(index + 1, len(generated_questions), generated_question)
-        results.append(
-            evaluate_generated_question_object(
-                generated_question,
-                strict_mode=strict_mode,
-                config=config,
-                client=client,
-                debug=debug,
-                index=index,
-                auto_repair=auto_repair,
-                max_loop=max_loop,
-            )
+        return evaluate_generated_question_object(
+            generated_question,
+            strict_mode=strict_mode,
+            config=config,
+            client=client,
+            debug=debug,
+            index=index,
+            auto_repair=auto_repair,
+            max_loop=max_loop,
         )
+
+    gemma_runs = generated_question_gemma_runs(config)
+    gemma_object_limit = max(1, generated_question_gemma_concurrency(config) // gemma_runs)
+    worker_count = min(
+        clamp_generated_question_workers(workers),
+        gemma_object_limit,
+        max(1, len(generated_questions)),
+    )
+    if worker_count == 1:
+        results = [evaluate_one(index, question) for index, question in enumerate(generated_questions)]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="generated-question") as executor:
+            results = list(executor.map(evaluate_one, range(len(generated_questions)), generated_questions))
 
     if should_return_aggregate(payload, generated_questions):
         return public_generated_question_output(aggregate_generated_question_results(results), debug=debug)
