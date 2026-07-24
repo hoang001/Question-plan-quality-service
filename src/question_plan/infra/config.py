@@ -26,6 +26,9 @@ class AppConfig:
     request_timeout_seconds: int
     models_endpoint: str | None
     chat_completions_endpoint: str | None
+    gemma_self_consistency_runs: int
+    gemma_evaluation_concurrency: int
+    gemma_request_timeout_seconds: int
 
 
 def generated_question_reasoning_model(config: AppConfig) -> str:
@@ -38,6 +41,18 @@ def generated_question_fast_model(config: AppConfig) -> str:
     """Model nhanh cho generated question; giữ mapping Gemma ở PRIMARY_JUDGE_MODEL hiện tại."""
 
     return str(config.primary_judge_model)
+
+
+def generated_question_gemma_runs(config: AppConfig | None) -> int:
+    """Số lần Gemma đánh giá độc lập; hỗ trợ đặt 1 để rollback nhanh."""
+
+    return max(1, min(int(getattr(config, "gemma_self_consistency_runs", 2)), 2))
+
+
+def generated_question_gemma_concurrency(config: AppConfig | None) -> int:
+    """Giới hạn tổng số Gemma call đồng thời trong batch."""
+
+    return max(1, min(int(getattr(config, "gemma_evaluation_concurrency", 4)), 4))
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -84,4 +99,7 @@ def load_config(root_dir: Path) -> AppConfig:
         request_timeout_seconds=env_int("REQUEST_TIMEOUT_SECONDS", 60),
         models_endpoint=os.getenv("LLM_MODELS_ENDPOINT", "").strip() or None,
         chat_completions_endpoint=os.getenv("LLM_CHAT_COMPLETIONS_ENDPOINT", "").strip() or None,
+        gemma_self_consistency_runs=env_int("GEMMA_SELF_CONSISTENCY_RUNS", 2),
+        gemma_evaluation_concurrency=env_int("GEMMA_EVALUATION_CONCURRENCY", 4),
+        gemma_request_timeout_seconds=env_int("GEMMA_REQUEST_TIMEOUT_SECONDS", 30),
     )

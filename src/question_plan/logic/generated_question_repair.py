@@ -6,10 +6,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from ..infra.config import AppConfig, generated_question_fast_model, generated_question_reasoning_model
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..shared.utils import parse_json_output
+from ..schemas.generated_question_contracts import (
+    ScopedRepairOutput,
+    contract_schema_text,
+    validation_error_text,
+)
 from ..utils.json_pointer import JsonPointerError, apply_json_patch, get_by_json_pointer
 from .generated_question_schema import (
     default_context_paths,
@@ -21,7 +28,6 @@ from .generated_question_schema import (
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
 REPAIR_RULES_PATH = KNOWLEDGE_DIR / "generated_question_repair_rules.md"
-SCOPED_REPAIR_OUTPUT_SCHEMA_PATH = KNOWLEDGE_DIR / "generated_question_scoped_repair_output_schema.md"
 
 
 def load_text(path: Path) -> str:
@@ -129,8 +135,8 @@ def build_scoped_repair_context(
 def build_generated_question_scoped_repair_messages(
     scoped_payload: dict[str, Any],
     repair_rules_text: str,
-    output_schema_text: str,
 ) -> list[dict[str, str]]:
+    output_schema_text = contract_schema_text(ScopedRepairOutput)
     return [
         {
             "role": "system",
@@ -174,8 +180,14 @@ def normalize_scoped_repair_result(
     index: int = 0,
     repair_intent: str = "",
 ) -> dict[str, Any]:
-    if not isinstance(parsed, dict):
-        return manual_review_result("Scoped repair không trả JSON object hợp lệ.", generated_question, index)
+    try:
+        parsed = ScopedRepairOutput.model_validate(parsed).model_dump()
+    except ValidationError as exc:
+        return manual_review_result(
+            "Bộ sửa chữa có giới hạn trả kết quả không đúng cấu trúc: " + validation_error_text(exc),
+            generated_question,
+            index,
+        )
     status = str(parsed.get("repair_status") or "")
     if status == "needs_manual_review":
         reasons = [str(value).strip() for value in parsed.get("failed_reason") or [] if str(value).strip()]
@@ -252,7 +264,6 @@ def repair_generated_question_scoped(
     messages = build_generated_question_scoped_repair_messages(
         context["payload"],
         load_text(REPAIR_RULES_PATH),
-        load_text(SCOPED_REPAIR_OUTPUT_SCHEMA_PATH),
     )
     model = (
         generated_question_fast_model(config)

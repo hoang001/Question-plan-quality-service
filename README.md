@@ -72,6 +72,8 @@ Lệnh ngắn mặc định:
 python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json
 ```
 
+CLI mặc định xử lý tối đa 3 generated question song song. Có thể điều chỉnh trong khoảng 1..4 bằng `--workers`, ví dụ `--workers 2`; dùng `--workers 1` để chạy tuần tự.
+
 Nếu muốn chỉ đánh giá một số object đầu tiên:
 
 ```bash
@@ -236,10 +238,10 @@ src/
       interaction_type_knowledge.py
       prompts.py
       generated_question_quality_criteria.md
-      generated_question_output_schema.md
     schemas/
       service_schema.py
       eval_schema.py
+      generated_question_contracts.py
     shared/
       real_schema.py
       utils.py
@@ -247,6 +249,7 @@ docs/
   generated_question_quality_flow.md
 tests/
   test_generated_question_service.py
+  test_generated_question_solution_gate.py
 ```
 
 ## Git Hygiene
@@ -274,7 +277,7 @@ src/question_plan/logic/generated_question_repair.py
 src/question_plan/logic/generated_question_schema.py
 src/question_plan/logic/generated_question_schema_inspector.py
 src/question_plan/knowledge/generated_question_quality_criteria.md
-src/question_plan/knowledge/generated_question_output_schema.md
+src/question_plan/schemas/generated_question_contracts.py
 docs/generated_question_quality_flow.md
 tests/test_generated_question_service.py
 ```

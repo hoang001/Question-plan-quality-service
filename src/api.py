@@ -166,6 +166,7 @@ def evaluate_generated_questions_api(
     debug: bool = Query(default=True, description="false trả compact output; true trả diagnostics an toàn."),
     auto_repair: bool = Query(default=True, description="Bật repair tự động nếu lỗi sửa được an toàn."),
     max_loop: int = Query(default=3, description="Số vòng repair/check tối đa, service clamp trong khoảng 1..3."),
+    workers: int = Query(default=2, ge=1, le=4, description="Số generated question xử lý song song; Gemma tối đa 4 call."),
     _: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
     try:
@@ -175,6 +176,7 @@ def evaluate_generated_questions_api(
             debug=debug,
             auto_repair=auto_repair,
             max_loop=max_loop,
+            workers=workers,
         )
     except HTTPException:
         raise

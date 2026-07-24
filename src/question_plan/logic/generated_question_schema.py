@@ -102,7 +102,7 @@ def default_repair_intent(category: str, reason: str = "", location: str = "") -
         return "reduce_hint_leakage"
     if category == "solution_quality":
         return "clean_solution_reasoning"
-    if category in {"interaction_schema", "render_schema", "runtime"}:
+    if category in {"interaction_schema", "render_schema"}:
         return "fix_schema"
     if category == "pedagogical_quality":
         return "improve_stem_clarity"
@@ -279,13 +279,6 @@ def normalize_issue(value: Any, index: int) -> dict[str, Any]:
         error_snippet=str(issue.get("error_snippet") or "").strip(),
         required_context_paths=required_context_paths,
         repair_intent=str(issue.get("repair_intent") or "").strip(),
-    )
-    return make_issue(
-        severity=severity if severity in SEVERITIES else "needs_review",
-        category=category if category in CATEGORIES else "runtime",
-        location=str(issue.get("location") or f"issues[{index}]").strip(),
-        reason=str(issue.get("reason") or "Issue thiếu reason rõ ràng.").strip(),
-        suggestion=str(issue.get("suggestion") or "Cần review thủ công.").strip(),
     )
 
 
@@ -1275,6 +1268,20 @@ def aggregate_generated_question_results(results: list[dict[str, Any]]) -> dict[
         "warning": 0,
         "repaired": 0,
         "repair_failed": 0,
+        "judge_calls": 0,
+        "judge_fallbacks": 0,
+        "resolver_calls": 0,
+        "resolver_fallbacks": 0,
+        "judge_gemma_dual_runs": 0,
+        "judge_gemma_agreements": 0,
+        "judge_gemma_disagreements": 0,
+        "judge_gemma_run_1_invalid": 0,
+        "judge_gemma_run_2_invalid": 0,
+        "resolver_gemma_dual_runs": 0,
+        "resolver_gemma_agreements": 0,
+        "resolver_gemma_disagreements": 0,
+        "resolver_gemma_run_1_invalid": 0,
+        "resolver_gemma_run_2_invalid": 0,
     }
     failed_reason: list[str] = []
     suggestions: list[str] = []
@@ -1285,12 +1292,67 @@ def aggregate_generated_question_results(results: list[dict[str, Any]]) -> dict[
             summary["repaired"] += 1
         elif result.get("repair_status") == "failed":
             summary["repair_failed"] += 1
+        if result.get("judge_attempt_count"):
+            summary["judge_calls"] += 1
+            if result.get("judge_fallback_called"):
+                summary["judge_fallbacks"] += 1
+            if result.get("judge_gemma_run_count") == 2:
+                summary["judge_gemma_dual_runs"] += 1
+                if result.get("judge_gemma_agreement") is True:
+                    summary["judge_gemma_agreements"] += 1
+                elif result.get("judge_fallback_reason") == "gemma_disagreement":
+                    summary["judge_gemma_disagreements"] += 1
+                elif result.get("judge_fallback_reason") in {"gemma_run_1_invalid", "gemma_run_2_invalid"}:
+                    summary[result["judge_fallback_reason"].replace("gemma_", "judge_gemma_")] += 1
+        anchor = result.get("solution_anchor_result")
+        if isinstance(anchor, dict) and anchor.get("resolver_attempt_count"):
+            summary["resolver_calls"] += 1
+            if anchor.get("resolver_fallback_called"):
+                summary["resolver_fallbacks"] += 1
+            if anchor.get("resolver_gemma_run_count") == 2:
+                summary["resolver_gemma_dual_runs"] += 1
+                if anchor.get("resolver_gemma_agreement") is True:
+                    summary["resolver_gemma_agreements"] += 1
+                elif anchor.get("resolver_fallback_reason") == "gemma_disagreement":
+                    summary["resolver_gemma_disagreements"] += 1
+                elif anchor.get("resolver_fallback_reason") in {"gemma_run_1_invalid", "gemma_run_2_invalid"}:
+                    summary[anchor["resolver_fallback_reason"].replace("gemma_", "resolver_gemma_")] += 1
         for reason in result.get("failed_reason") or []:
             if reason and reason not in failed_reason:
                 failed_reason.append(reason)
         for suggestion in result.get("suggestions") or []:
             if suggestion and suggestion not in suggestions:
                 suggestions.append(suggestion)
+    summary["judge_fallback_rate"] = (
+        round(summary["judge_fallbacks"] / summary["judge_calls"], 4)
+        if summary["judge_calls"]
+        else 0.0
+    )
+    summary["resolver_fallback_rate"] = (
+        round(summary["resolver_fallbacks"] / summary["resolver_calls"], 4)
+        if summary["resolver_calls"]
+        else 0.0
+    )
+    summary["judge_gemma_disagreement_rate"] = (
+        round(summary["judge_gemma_disagreements"] / summary["judge_gemma_dual_runs"], 4)
+        if summary["judge_gemma_dual_runs"]
+        else 0.0
+    )
+    summary["judge_gemma_agreement_rate"] = (
+        round(summary["judge_gemma_agreements"] / summary["judge_gemma_dual_runs"], 4)
+        if summary["judge_gemma_dual_runs"]
+        else 0.0
+    )
+    summary["resolver_gemma_disagreement_rate"] = (
+        round(summary["resolver_gemma_disagreements"] / summary["resolver_gemma_dual_runs"], 4)
+        if summary["resolver_gemma_dual_runs"]
+        else 0.0
+    )
+    summary["resolver_gemma_agreement_rate"] = (
+        round(summary["resolver_gemma_agreements"] / summary["resolver_gemma_dual_runs"], 4)
+        if summary["resolver_gemma_dual_runs"]
+        else 0.0
+    )
     return {
         "is_good": all(result.get("is_good") for result in results),
         "failed_reason": failed_reason,

@@ -8,16 +8,18 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from ..infra.config import AppConfig, generated_question_fast_model
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..shared.utils import parse_json_output
+from ..schemas.generated_question_contracts import SpellingOutput, contract_schema_text
 from .generated_question_schema import location_to_json_pointer, make_issue
 
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
 SPELLING_RULES_PATH = KNOWLEDGE_DIR / "generated_question_spelling_rules.md"
-SPELLING_OUTPUT_SCHEMA_PATH = KNOWLEDGE_DIR / "generated_question_spelling_output_schema.md"
 SPELLING_WHITELIST_PATH = KNOWLEDGE_DIR / "spelling_whitelist_vi.txt"
 MATH_PATTERN = re.compile(r"(\$\$.*?\$\$|\$.*?\$|```.*?```)", re.DOTALL)
 VIETNAMESE_ACCENT_CHARS = set("àáảãạăằắẳẵặâầấẩẫậđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ")
@@ -274,7 +276,6 @@ def dictionary_domain_issues(node: dict[str, Any], whitelist: set[str]) -> list[
 def build_generated_question_spelling_messages(
     text_nodes: list[dict[str, Any]],
     rules_text: str,
-    output_schema_text: str,
 ) -> list[dict[str, str]]:
     payload_nodes = []
     for node in text_nodes:
@@ -290,6 +291,7 @@ def build_generated_question_spelling_messages(
             }
         )
     language_policy = "Mọi chuỗi người đọc trong JSON output phải viết bằng tiếng Việt có dấu."
+    output_schema_text = contract_schema_text(SpellingOutput)
     return [
         {
             "role": "system",
@@ -337,7 +339,9 @@ def normalize_spelling_issue(issue: Any, index: int) -> dict[str, Any]:
 
 
 def normalize_spelling_llm_result(parsed: Any) -> dict[str, Any]:
-    if not isinstance(parsed, dict):
+    try:
+        parsed = SpellingOutput.model_validate(parsed).model_dump()
+    except ValidationError:
         return {
             "spelling_status": "checked",
             "llm_checked": True,
@@ -392,8 +396,7 @@ def check_spelling_and_wording(
     if not candidate_nodes:
         candidate_nodes = nodes[:20]
     rules_text = load_text(SPELLING_RULES_PATH)
-    output_schema_text = load_text(SPELLING_OUTPUT_SCHEMA_PATH)
-    messages = build_generated_question_spelling_messages(candidate_nodes, rules_text, output_schema_text)
+    messages = build_generated_question_spelling_messages(candidate_nodes, rules_text)
     model = generated_question_fast_model(config)
     start = time.perf_counter()
     try:

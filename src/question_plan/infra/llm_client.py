@@ -71,6 +71,11 @@ class LLMClient:
         data, endpoint = self.post_json_with_fallback(
             self.configured_endpoints(self.config.chat_completions_endpoint, DEFAULT_CHAT_COMPLETIONS_ENDPOINTS),
             payload,
+            timeout_seconds=(
+                max(1, int(getattr(self.config, "gemma_request_timeout_seconds", 30)))
+                if model == self.config.primary_judge_model
+                else None
+            ),
         )
         latency_seconds = round(time.perf_counter() - started_at, 3)
         return {
@@ -111,17 +116,31 @@ class LLMClient:
             raise ApiError("Đã thử các endpoint: " + " | ".join(attempt_errors), last_error.status_code if last_error else None)
         raise ApiError("Chưa thử endpoint nào.")
 
-    def post_json_with_fallback(self, endpoints: list[str], payload: dict[str, Any]) -> tuple[Any, str]:
+    def post_json_with_fallback(
+        self,
+        endpoints: list[str],
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int | None = None,
+    ) -> tuple[Any, str]:
         last_error: ApiError | None = None
         attempt_errors = []
+        deadline = time.perf_counter() + timeout_seconds if timeout_seconds is not None else None
         for endpoint in endpoints:
+            request_timeout = self.config.request_timeout_seconds
+            if deadline is not None:
+                request_timeout = deadline - time.perf_counter()
+                if request_timeout <= 0:
+                    last_error = ApiError(f"Đã hết timeout tổng {timeout_seconds}s trước endpoint {endpoint}.")
+                    attempt_errors.append(str(last_error))
+                    break
             url = self.endpoint_url(endpoint)
             try:
                 response = requests.post(
                     url,
                     headers=self.auth_headers(),
                     json=payload,
-                    timeout=self.config.request_timeout_seconds,
+                    timeout=request_timeout,
                 )
             except requests.RequestException as exc:
                 last_error = ApiError(f"{endpoint}: {exc}")
