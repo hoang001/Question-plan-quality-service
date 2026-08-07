@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,7 @@ from pydantic import ValidationError
 
 from ..infra.config import (
     AppConfig,
-    generated_question_fast_model,
-    generated_question_gemma_runs,
-    generated_question_reasoning_model,
+    generated_question_resolver_model,
 )
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
@@ -24,7 +23,12 @@ from ..schemas.generated_question_contracts import (
     contract_schema_text,
     validation_error_text,
 )
-from ..utils.json_pointer import JsonPointerError, get_by_json_pointer
+from ..utils.json_pointer import (
+    JsonPointerError,
+    get_by_json_pointer,
+    parse_json_pointer,
+    set_by_json_pointer,
+)
 from .generated_question_schema import (
     generated_question_id,
     get_answer_specs,
@@ -35,6 +39,7 @@ from .generated_question_schema import (
     make_issue,
     option_id,
     option_text,
+    validate_generated_question_object,
 )
 
 
@@ -49,6 +54,20 @@ VALID_INTENTS = {
     "needs_manual_review",
 }
 OPTION_INTERACTION_TYPES = {"single_choice", "multiple_choice", "choice_blank_fill", "matching"}
+RESOLVER_OUTPUT_INVARIANTS = """OUTPUT INVARIANTS:
+- `final_answer` bắt buộc phải là một JSON object; không được là string, array hoặc null.
+- `final_answer` phải có bốn field semantic: `text`, `matched_option_id`, `correctOptionIds`, `expected`; không được bỏ bất kỳ field semantic nào.
+- `final_answer.text` bắt buộc phải tồn tại và phải là JSON string.
+- `matched_option_id` là JSON string hoặc null; `correctOptionIds` luôn là JSON array.
+- `evidence_from_solution` là metadata tùy chọn. Nếu có, code sẽ thử grounding và tự khôi phục đoạn nguyên văn; field này không quyết định resolver contract.
+- Khi `resolver_status="resolved"`, `final_answer.text` phải là chuỗi không rỗng.
+- Khi `resolver_status="needs_manual_review"`, `final_answer.text` phải là chuỗi rỗng `""`.
+- `answer_spec_alignment` phải là `matched`, `equivalent` hoặc `mismatched`.
+- `matched`/`equivalent` chỉ dùng khi `answerSpec_matches_solution=true`; `mismatched` chỉ dùng khi `answerSpec_matches_solution=false`.
+- Dùng `equivalent` khi answerSpec khác cách biểu diễn nhưng tương đương semantic với kết luận solution.
+- Không được bỏ field `final_answer` hoặc `final_answer.text`.
+- Không dùng chuỗi `"None"`, `"null"` hoặc `"N/A"`.
+- Chỉ trả một JSON object đúng schema; không viết markdown, code fence hoặc nội dung bên ngoài JSON."""
 
 
 def load_text(path: Path) -> str:
@@ -78,6 +97,62 @@ def deep_content_text(value: Any) -> str:
 
 def solution_text(generated_question: dict[str, Any]) -> str:
     return deep_content_text(generated_question.get("solutions"))
+
+
+def _normalize_resolver_evidence(value: str) -> str:
+    """Normalize formatting-only differences without semantic equivalence."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = re.sub(r"\\(?:left|right)\b", "", normalized)
+    normalized = normalized.replace(r"\(", "").replace(r"\)", "")
+    normalized = normalized.replace(r"\[", "").replace(r"\]", "")
+    normalized = normalized.replace("$", "")
+    normalized = re.sub(r"\\(?:,|;|!| )", "", normalized)
+    normalized = re.sub(r"\\(?:times|cdot)\b", "*", normalized)
+    normalized = normalized.translate(str.maketrans({"×": "*", "·": "*", "÷": "/", "−": "-"}))
+    return re.sub(r"\s+", "", normalized)
+
+
+def _solution_evidence_excerpts(generated_question: dict[str, Any]) -> list[str]:
+    """Return exact source excerpts, preferring paragraphs over whole blocks."""
+
+    excerpts: list[str] = []
+    solutions = generated_question.get("solutions")
+    solutions = solutions if isinstance(solutions, list) else []
+    for solution in solutions:
+        if not isinstance(solution, dict):
+            continue
+        blocks = solution.get("solutionContent")
+        blocks = blocks if isinstance(blocks, list) else []
+        for block in blocks:
+            text = deep_content_text(block).strip()
+            if not text:
+                continue
+            for paragraph in re.split(r"(?:\r?\n\s*){2,}", text):
+                paragraph = paragraph.strip()
+                if paragraph and paragraph not in excerpts:
+                    excerpts.append(paragraph)
+            if text not in excerpts:
+                excerpts.append(text)
+    return excerpts
+
+
+def _ground_resolver_evidence(
+    evidence: str,
+    generated_question: dict[str, Any],
+) -> str | None:
+    """Recover an exact source excerpt after harmless formatting changes."""
+
+    source = solution_text(generated_question)
+    if evidence in source:
+        return evidence
+    normalized_evidence = _normalize_resolver_evidence(evidence)
+    if len(normalized_evidence) < 3:
+        return None
+    for excerpt in _solution_evidence_excerpts(generated_question):
+        if normalized_evidence in _normalize_resolver_evidence(excerpt):
+            return excerpt
+    return None
 
 
 def compact_generated_question_for_solution_anchor(generated_question: dict[str, Any]) -> dict[str, Any]:
@@ -162,7 +237,11 @@ def build_solution_anchor_resolver_messages(
                 "trùng lỗi trình bày đó. Mọi reason/suggestion phải là tiếng Việt có dấu.\n\n"
                 f"RESOLVER RULES:\n{rules_text}\n\n"
                 f"OUTPUT SCHEMA:\n{output_schema_text}\n\n"
-                f"DYNAMIC PAYLOAD:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                f"DYNAMIC PAYLOAD:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+                f"{RESOLVER_OUTPUT_INVARIANTS}\n"
+                "Chỉ trả một JSON object đúng schema: không thêm field, không bỏ field bắt buộc, "
+                "dùng null thay vì chuỗi \"None\", enum đúng giá trị trong schema, không markdown. "
+                "Không cần sao chép evidence_from_solution; code tự dựng metadata grounding khi có thể."
             ),
         },
     ]
@@ -190,13 +269,14 @@ def manual_review_result(
     result = {
         "resolver_status": "needs_manual_review",
         "final_answer": {
-            "text": None,
+            "text": "",
             "matched_option_id": None,
             "correctOptionIds": [],
             "expected": None,
             "evidence_from_solution": "",
         },
         "answerSpec_matches_solution": False,
+        "answer_spec_alignment": "mismatched",
         "fields_to_fix": [],
         "issues": [
             _issue(
@@ -215,26 +295,72 @@ def manual_review_result(
 
 
 def resolver_contract_error(error: str) -> dict[str, Any]:
-    return manual_review_result(
+    result = manual_review_result(
         f"Bộ phân giải lời giải trả kết quả không đúng cấu trúc: {error}",
         "Kiểm tra cấu trúc dữ liệu của bộ phân giải lời giải và chạy lại trước khi sửa các trường nghiệp vụ.",
         contract_error=error,
     )
+    return result
 
 
-def _valid_fix_path(generated_question: dict[str, Any], path: str) -> bool:
-    tokens = [token for token in path.split("/") if token]
+def resolver_runtime_error(error: str) -> dict[str, Any]:
+    result = manual_review_result(
+        "Runtime error khi gọi Solution Resolver.",
+        "Kiểm tra kết nối/model và chạy lại trước khi sửa các trường nghiệp vụ.",
+    )
+    result["issues"] = [
+        _issue(
+            severity="needs_review",
+            category="runtime",
+            location="/solutions",
+            reason="Runtime error khi gọi Solution Resolver.",
+            suggestion="Kiểm tra kết nối/model và chạy lại service.",
+            repair_intent="needs_manual_review",
+        )
+    ]
+    result["resolver_runtime_error"] = error
+    return result
+
+
+def _compatible_replacement_type(current: Any, replacement: Any) -> bool:
+    if current is None:
+        return replacement is None
+    if isinstance(current, bool):
+        return isinstance(replacement, bool)
+    if isinstance(current, (int, float)):
+        return isinstance(replacement, (int, float)) and not isinstance(
+            replacement, bool
+        )
+    return isinstance(replacement, type(current))
+
+
+def _valid_fix_path(
+    generated_question: dict[str, Any],
+    path: str,
+    replacement: Any,
+) -> bool:
+    try:
+        tokens = parse_json_pointer(path)
+    except JsonPointerError:
+        return False
     if len(tokens) < 5 or tokens[0] != "questionItems" or tokens[2] != "answerSpecs":
         return False
     if not tokens[1].isdigit() or not tokens[3].isdigit() or tokens[4] != "expected":
         return False
-    if len(tokens) > 5 and tokens[-1] not in {"correctOptionId", "correctOptionIds", "correctValue", "value"}:
+    allowed_roots = {
+        f"{context['answerSpec_path']}/expected"
+        for context in compact_generated_question_for_solution_anchor(generated_question)["interaction_contexts"]
+    }
+    if not any(path == root or path.startswith(root + "/") for root in allowed_roots):
         return False
     try:
-        get_by_json_pointer(generated_question, path)
+        current = get_by_json_pointer(generated_question, path)
+        if not _compatible_replacement_type(current, replacement):
+            return False
+        candidate = set_by_json_pointer(generated_question, path, replacement)
     except JsonPointerError:
         return False
-    return True
+    return bool(validate_generated_question_object(candidate).get("valid"))
 
 
 def _known_option_ids(generated_question: dict[str, Any]) -> set[str]:
@@ -291,29 +417,24 @@ def _dedupe_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(parsed, dict):
-        parsed = dict(parsed)
-        raw_answer = parsed.get("final_answer")
-        if isinstance(raw_answer, dict):
-            answer = dict(raw_answer)
-        else:
-            answer = {
-                "text": raw_answer if isinstance(raw_answer, str) else None,
-                "expected": raw_answer if raw_answer is not None and not isinstance(raw_answer, str) else None,
-            }
-        if answer.get("correctOptionIds") is None:
-            answer["correctOptionIds"] = []
-        if parsed.get("resolver_status") == "resolved" and not str(answer.get("evidence_from_solution") or "").strip():
-            answer["evidence_from_solution"] = solution_text(generated_question)
-        else:
-            answer.setdefault("evidence_from_solution", "")
-        parsed["final_answer"] = answer
     try:
         parsed = SolutionResolverOutput.model_validate(parsed).model_dump()
     except ValidationError as exc:
         return resolver_contract_error(validation_error_text(exc))
     status = parsed["resolver_status"]
     answer = parsed["final_answer"]
+    answer_spec_matches = parsed["answerSpec_matches_solution"]
+    answer_spec_alignment = parsed.get("answer_spec_alignment") or (
+        "matched" if answer_spec_matches else "mismatched"
+    )
+    if answer_spec_alignment in {"matched", "equivalent"} and not answer_spec_matches:
+        return resolver_contract_error(
+            "answer_spec_alignment matched/equivalent yêu cầu answerSpec_matches_solution=true"
+        )
+    if answer_spec_alignment == "mismatched" and answer_spec_matches:
+        return resolver_contract_error(
+            "answer_spec_alignment=mismatched yêu cầu answerSpec_matches_solution=false"
+        )
 
     final_answer = {
         "text": answer.get("text"),
@@ -327,15 +448,41 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
         for key in ("text", "matched_option_id", "correctOptionIds", "expected")
     ):
         return resolver_contract_error("resolver_status=resolved nhưng final_answer không có kết luận cụ thể")
-    if status == "resolved" and not final_answer["evidence_from_solution"]:
-        return resolver_contract_error("resolver_status=resolved nhưng final_answer.evidence_from_solution rỗng")
+    if status == "resolved" and not final_answer["text"].strip():
+        return resolver_contract_error(
+            "resolver_status=resolved nhưng final_answer.text rỗng"
+        )
+    if status == "resolved":
+        supplied_evidence = final_answer["evidence_from_solution"]
+        final_answer["evidence_from_solution"] = (
+            _ground_resolver_evidence(supplied_evidence, generated_question)
+            if supplied_evidence
+            else None
+        ) or ""
 
     matched_option_id = str(final_answer.get("matched_option_id") or "")
     if matched_option_id and matched_option_id not in _known_option_ids(generated_question):
         return resolver_contract_error("final_answer.matched_option_id không tồn tại trong options")
+    if any(
+        str(option_id) not in _known_option_ids(generated_question)
+        for option_id in final_answer["correctOptionIds"]
+    ):
+        return resolver_contract_error("final_answer.correctOptionIds chứa option không tồn tại")
 
-    issues = [issue for issue in (_normalize_issue(value) for value in parsed.get("issues") or []) if issue]
+    for value in parsed["issues"]:
+        raw_location = str(value["location"])
+        if location_to_json_pointer(raw_location) != raw_location:
+            return resolver_contract_error("issue.location không phải JSON Pointer chuẩn")
+        try:
+            get_by_json_pointer(generated_question, raw_location)
+        except JsonPointerError:
+            return resolver_contract_error("issue.location không tồn tại trong generated question")
+    issues = [issue for issue in (_normalize_issue(value) for value in parsed["issues"]) if issue]
     if status == "needs_manual_review":
+        if final_answer["text"]:
+            return resolver_contract_error(
+                "resolver_status=needs_manual_review phải có final_answer.text rỗng"
+            )
         manual_issue = next(
             (
                 issue for issue in issues
@@ -344,11 +491,22 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
             None,
         )
         if manual_issue is None:
-            return manual_review_result("Solution không có kết luận cuối phù hợp với interaction type.")
+            return resolver_contract_error(
+                "resolver_status=needs_manual_review nhưng thiếu solution_quality issue tương ứng"
+            )
+        if parsed["answerSpec_matches_solution"] or parsed["fields_to_fix"]:
+            return resolver_contract_error(
+                "needs_manual_review phải có answerSpec_matches_solution=false và fields_to_fix rỗng"
+            )
+        if len(issues) != 1:
+            return resolver_contract_error(
+                "needs_manual_review phải có đúng một solution_quality issue"
+            )
         return {
             "resolver_status": "needs_manual_review",
             "final_answer": final_answer,
             "answerSpec_matches_solution": False,
+            "answer_spec_alignment": "mismatched",
             "fields_to_fix": [],
             "issues": [manual_issue],
         }
@@ -360,7 +518,7 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
             invalid_fix_count += 1
             continue
         path = location_to_json_pointer(str(value.get("path") or ""))
-        if _valid_fix_path(generated_question, path):
+        if _valid_fix_path(generated_question, path, value.get("value")):
             fixes.append(
                 {
                     "path": path,
@@ -373,11 +531,28 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
             invalid_fix_count += 1
     if invalid_fix_count:
         return resolver_contract_error("fields_to_fix chứa path/value không hợp lệ")
-    answer_spec_matches = parsed["answerSpec_matches_solution"]
     if answer_spec_matches and fixes:
         return resolver_contract_error("answerSpec_matches_solution=true nhưng fields_to_fix không rỗng")
     if not answer_spec_matches and not fixes:
         return resolver_contract_error("answerSpec_matches_solution=false nhưng fields_to_fix rỗng")
+    align_issues = [
+        issue
+        for issue in issues
+        if issue.get("category") == "solution_anchor_consistency"
+        and issue.get("repair_intent") == "align_fields_to_solution"
+    ]
+    if answer_spec_matches and align_issues:
+        return resolver_contract_error(
+            "answerSpec_matches_solution=true nhưng vẫn có issue căn chỉnh answerSpec"
+        )
+    if not answer_spec_matches and not align_issues:
+        return resolver_contract_error(
+            "answerSpec_matches_solution=false nhưng thiếu issue căn chỉnh answerSpec"
+        )
+    if any(issue.get("category") == "solution_quality" for issue in issues):
+        return resolver_contract_error(
+            "resolver_status=resolved không được chứa solution_quality issue"
+        )
     issues = [
         issue
         for issue in issues
@@ -394,6 +569,7 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
         "resolver_status": "resolved",
         "final_answer": final_answer,
         "answerSpec_matches_solution": answer_spec_matches,
+        "answer_spec_alignment": answer_spec_alignment,
         "fields_to_fix": fixes,
         "issues": _dedupe_issues(issues),
     }
@@ -402,7 +578,7 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
 def _call_solution_resolver(
     *,
     generated_question: dict[str, Any],
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     model: str,
     client: LLMClient,
     debug: bool,
@@ -415,60 +591,7 @@ def _call_solution_resolver(
             return resolver_contract_error(parse_error or "Không parse được output của Solution Resolver.")
         return normalize_solution_anchor_result(parsed, generated_question)
     except Exception as exc:
-        return resolver_contract_error(str(exc))
-
-
-def _resolver_result_valid(result: dict[str, Any]) -> bool:
-    return not result.get("resolver_contract_error")
-
-
-def _freeze(value: Any) -> Any:
-    if isinstance(value, dict):
-        return tuple(sorted((str(key), _freeze(item)) for key, item in value.items()))
-    if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
-    return value
-
-
-def _is_simple_answer(value: Any) -> bool:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return True
-    return isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value)
-
-
-def _resolver_signature(result: dict[str, Any]) -> tuple[Any, ...]:
-    answer = result.get("final_answer") or {}
-    text_answer = " ".join(str(answer.get("text") or "").lower().split())
-    expected_answer = answer.get("expected")
-    option_answer = str(answer.get("matched_option_id") or "")
-    option_answers = tuple(sorted(str(value) for value in answer.get("correctOptionIds") or []))
-    fixes = tuple(
-        sorted((str(fix.get("path") or ""), _freeze(fix.get("value"))) for fix in result.get("fields_to_fix") or [])
-    )
-    issues = tuple(
-        sorted(
-            (
-                str(issue.get("location") or ""),
-                str(issue.get("category") or ""),
-                str(issue.get("severity") or ""),
-                str(issue.get("repair_intent") or ""),
-            )
-            for issue in result.get("issues") or []
-        )
-    )
-    return (
-        str(result.get("resolver_status") or ""),
-        option_answer,
-        option_answers,
-        (
-            _freeze(expected_answer)
-            if _is_simple_answer(expected_answer) or not (text_answer or option_answer or option_answers)
-            else text_answer
-        ),
-        bool(result.get("answerSpec_matches_solution")),
-        fixes,
-        issues,
-    )
+        return resolver_runtime_error(str(exc))
 
 
 def resolve_solution_anchor_consistency(
@@ -487,64 +610,17 @@ def resolve_solution_anchor_consistency(
         generated_question,
         load_text(RESOLVER_RULES_PATH),
     )
-    fast_model = generated_question_fast_model(config)
-    reasoning_model = generated_question_reasoning_model(config)
-    runs = generated_question_gemma_runs(config)
-
-    def call_fast() -> dict[str, Any]:
-        return _call_solution_resolver(
-            generated_question=generated_question,
-            messages=messages,
-            model=fast_model,
-            client=client,
-            debug=debug,
-        )
-
-    if runs == 2:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(call_fast) for _ in range(2)]
-            gemma_results = [future.result() for future in futures]
-    else:
-        gemma_results = [call_fast()]
-
-    result = gemma_results[0]
-    agreement: bool | None = None
-    fallback_reason: str | None = None
-    if not _resolver_result_valid(result):
-        fallback_reason = "gemma_run_1_invalid"
-    elif runs == 2 and not _resolver_result_valid(gemma_results[1]):
-        fallback_reason = "gemma_run_2_invalid"
-    elif runs == 2:
-        agreement = _resolver_signature(result) == _resolver_signature(gemma_results[1])
-        fallback_reason = None if agreement else "gemma_disagreement"
-    else:
-        reason = " ".join(str(issue.get("reason") or "") for issue in result.get("issues") or []).lower()
-        if result.get("resolver_status") == "needs_manual_review" and any(
-            marker in reason for marker in ("mơ hồ", "quá phức tạp", "không chắc chắn")
-        ):
-            fallback_reason = "gemma_requires_fallback"
-
-    fallback_called = bool(
-        fallback_reason
-        and getattr(config, "use_fallback_judge", True)
-        and reasoning_model
-        and reasoning_model != fast_model
+    resolver_model = generated_question_resolver_model(config)
+    result = _call_solution_resolver(
+        generated_question=generated_question,
+        messages=messages,
+        model=resolver_model,
+        client=client,
+        debug=debug,
     )
-    if fallback_called:
-        result = _call_solution_resolver(
-            generated_question=generated_question,
-            messages=messages,
-            model=reasoning_model,
-            client=client,
-            debug=debug,
-        )
-    elif fallback_reason == "gemma_disagreement":
-        result = resolver_contract_error("Hai lần đánh giá Gemma không thống nhất và không có Qwen fallback.")
-
-    result["resolver_model"] = reasoning_model if fallback_called else fast_model
-    result["resolver_attempt_count"] = runs + int(fallback_called)
-    result["resolver_fallback_called"] = fallback_called
-    result["resolver_gemma_run_count"] = runs
-    result["resolver_gemma_agreement"] = agreement
-    result["resolver_fallback_reason"] = fallback_reason
+    result["resolver_model"] = resolver_model
+    result["resolver_attempt_count"] = 1
+    result["resolver_fallback_called"] = False
+    result["resolver_gemma_run_count"] = 1
+    result["resolver_fallback_reason"] = None
     return result

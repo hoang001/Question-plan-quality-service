@@ -20,7 +20,11 @@ LLM_MODELS_ENDPOINT=
 LLM_CHAT_COMPLETIONS_ENDPOINT=
 
 PRIMARY_JUDGE_MODEL=gemma-4-12b-it
-FALLBACK_JUDGE_MODEL=qwen3.6-35b
+FALLBACK_JUDGE_MODEL=gemma-4-26b
+SOLUTION_SPLITTER_MODEL=gemma-4-12b-it
+SOLUTION_CORRECTNESS_MODEL=gemma-4-26b
+PROCESS_PRESENTATION_MODEL=gemma-4-12b-it
+SOLUTION_RESOLVER_MODEL=gemma-4-26b
 USE_JUDGE_FALLBACK=true
 
 REQUEST_TIMEOUT_SECONDS=60
@@ -72,7 +76,7 @@ Lệnh ngắn mặc định:
 python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json
 ```
 
-CLI mặc định xử lý tối đa 3 generated question song song. Có thể điều chỉnh trong khoảng 1..4 bằng `--workers`, ví dụ `--workers 2`; dùng `--workers 1` để chạy tuần tự.
+CLI mặc định xử lý 2 generated question song song. Giá trị hiệu lực được giới hạn trong khoảng 1..2; dùng `--workers 1` để chạy tuần tự.
 
 Nếu muốn chỉ đánh giá một số object đầu tiên:
 
@@ -88,9 +92,23 @@ Các file output mặc định:
 
 ```text
 results/generated_question_check_repair_output.json
-results/generated_question_repair_report.md
+results/<input-stem>_report.md
 results/generated_question_repaired_objects.json
 ```
+
+Lệnh đầy đủ để chạy toàn bộ file mẫu, bật diagnostics và chỉ định rõ output:
+
+```powershell
+python cli.py --evaluate-generated-questions-service `
+  --input data/processed/math_9_bt_test.json `
+  --output results/math_9_bt_test_results.json `
+  --report-output results/math_9_bt_test_report.md `
+  --repaired-output results/math_9_bt_test_repaired.json `
+  --workers 2 `
+  --debug
+```
+
+Không truyền `--amount` nghĩa là xử lý toàn bộ object trong input.
 
 Nếu muốn bật repair tự động:
 
@@ -112,13 +130,13 @@ python cli.py --evaluate-generated-questions-service --input data/processed/math
 
 Nếu muốn truyền output path riêng:
 
-```bash
-python cli.py --evaluate-generated-questions-service ^
-  --input data/processed/math_9_bt_test.json ^
-  --auto-repair ^
-  --max-loop 3 ^
-  --output results/generated_question_check_repair_output.json ^
-  --report-output results/generated_question_repair_report.md ^
+```powershell
+python cli.py --evaluate-generated-questions-service `
+  --input data/processed/math_9_bt_test.json `
+  --auto-repair `
+  --max-loop 3 `
+  --output results/generated_question_check_repair_output.json `
+  --report-output results/math_9_bt_test_report.md `
   --repaired-output results/generated_question_repaired_objects.json
 ```
 
@@ -128,7 +146,7 @@ python cli.py --evaluate-generated-questions-service ^
 
 Compact result để tích hợp, gồm summary, issues đã dedupe/prioritize và `new_generated_question` nếu sửa được. Chạy thêm `--debug` nếu cần diagnostics nội bộ.
 
-`generated_question_repair_report.md`
+`<input-stem>_report.md`
 
 Report cho người đọc, tóm tắt good/bad/needs_review/warning, lỗi từng object, suggestion và trạng thái repair.
 
@@ -160,11 +178,16 @@ curl -X POST "http://localhost:8000/evaluate-generated-questions?strict_mode=tru
   -d @data/processed/math_9_bt_test.json
 ```
 
-Trong Swagger, endpoint generated question chỉ còn các query params public: `strict_mode`, `debug`, `auto_repair`, `max_loop`.
+Trong Swagger, endpoint generated question có các query params public: `strict_mode`, `debug`, `auto_repair`, `max_loop` và `workers`.
 
 Các policy đã được internal hóa:
 
-- Flow generated question chạy theo thứ tự structural validator → Solution Quality Judge (dùng Judge hiện có) → solution quality gate → Solution Resolver → normalize/repair.
+- Flow generated question chạy theo thứ tự structural validator → Splitter → hai Judge chuyên biệt chạy song song → aggregate → solution quality gate → Solution Resolver → normalize/repair.
+- Gemma 12B Splitter tạo ordered states và context requirements. Nếu output Splitter không canonical, code splitter là fallback cuối để tách text; nếu vẫn thất bại thì fail closed.
+- Ảnh HTTP(S) chỉ được gửi cho Splitter. Splitter trả mô tả grounded, code chèn mô tả vào bản sao stem nội bộ, còn Correctness/Process/Resolver không nhận lại ảnh.
+- Code Transition Analyzer chỉ gắn metadata và cảnh báo `verified_invalid + hard`; analyzer không tự quyết định public verdict.
+- Gemma 26B Correctness chỉ chấm đúng/sai toán học. Gemma 12B Process & Presentation chỉ chấm độ đầy đủ và chất lượng trình bày.
+- Hai Judge dùng chung tối đa một contract-correction call cho mỗi object. Handoff còn non-canonical hoặc runtime sau correction sẽ fail closed trước Resolver.
 - Nếu solution cần làm sạch hoặc review, flow xử lý solution trước và chưa căn chỉnh `answerSpecs`/options/hints; Resolver chỉ chạy khi solution vượt qua quality gate.
 - Solution Resolver là nguồn semantic duy nhất khi đối chiếu `solutions` với `answerSpecs/options/hints`.
 - Payload của Judge chỉ chứa ID cần thiết, instruction, stem, interaction type và solutions; không gửi answerSpecs, expected, options hoặc hints.
@@ -208,76 +231,5 @@ Output chuẩn:
 ```bash
 python cli.py --list-models
 python cli.py --ping
-python cli.py --ping --model qwen3.6-35b
-```
-
-## Cấu Trúc Chính
-
-```text
-cli.py
-src/
-  api.py
-  question_plan/
-    flows/
-      service.py
-      generated_question_service.py
-    infra/
-      config.py
-      llm_client.py
-      debug.py
-    logic/
-      judge.py
-      repair.py
-      rule_validator.py
-      generated_question_judge.py
-      generated_question_repair.py
-      generated_question_schema.py
-      generated_question_schema_inspector.py
-    knowledge/
-      plan_knowledge.py
-      interaction_type_knowledge.py
-      prompts.py
-      generated_question_quality_criteria.md
-    schemas/
-      service_schema.py
-      eval_schema.py
-      generated_question_contracts.py
-    shared/
-      real_schema.py
-      utils.py
-docs/
-  generated_question_quality_flow.md
-tests/
-  test_generated_question_service.py
-  test_generated_question_solution_gate.py
-```
-
-## Git Hygiene
-
-Không commit:
-
-```text
-.env
-cache/
-results/
-__pycache__/
-.pytest_cache/
-```
-
-Khi chỉ push luồng generated question checker, ưu tiên stage các file:
-
-```text
-README.md
-.gitignore
-cli.py
-src/api.py
-src/question_plan/flows/generated_question_service.py
-src/question_plan/logic/generated_question_judge.py
-src/question_plan/logic/generated_question_repair.py
-src/question_plan/logic/generated_question_schema.py
-src/question_plan/logic/generated_question_schema_inspector.py
-src/question_plan/knowledge/generated_question_quality_criteria.md
-src/question_plan/schemas/generated_question_contracts.py
-docs/generated_question_quality_flow.md
-tests/test_generated_question_service.py
+python cli.py --ping 
 ```

@@ -356,7 +356,7 @@ def merge_generated_question_results(
     index: int = 0,
 ) -> dict[str, Any]:
     normalized_llm = normalize_generated_question_result(
-        llm_result or {"is_good": True, "failed_reason": [], "suggestions": [], "issues": []},
+        llm_result,
         strict_mode=strict_mode,
         generated_question=generated_question,
         index=index,
@@ -1272,16 +1272,18 @@ def aggregate_generated_question_results(results: list[dict[str, Any]]) -> dict[
         "judge_fallbacks": 0,
         "resolver_calls": 0,
         "resolver_fallbacks": 0,
-        "judge_gemma_dual_runs": 0,
-        "judge_gemma_agreements": 0,
-        "judge_gemma_disagreements": 0,
-        "judge_gemma_run_1_invalid": 0,
-        "judge_gemma_run_2_invalid": 0,
-        "resolver_gemma_dual_runs": 0,
-        "resolver_gemma_agreements": 0,
-        "resolver_gemma_disagreements": 0,
-        "resolver_gemma_run_1_invalid": 0,
-        "resolver_gemma_run_2_invalid": 0,
+        "correctness_primary_26b_calls": 0,
+        "correctness_contract_correction_26b_calls": 0,
+        "correctness_rejudge_26b_calls": 0,
+        "primary_12b_calls": 0,
+        "contract_correction_12b_calls": 0,
+        "fallback_26b_calls": 0,
+        "fallback_reason_contract": 0,
+        "fallback_reason_resolver_mismatch": 0,
+        "http_retry_count": 0,
+        "non_canonical_count": 0,
+        "runtime_count": 0,
+        "correctness_error_type_normalized_count": 0,
     }
     failed_reason: list[str] = []
     suggestions: list[str] = []
@@ -1296,27 +1298,26 @@ def aggregate_generated_question_results(results: list[dict[str, Any]]) -> dict[
             summary["judge_calls"] += 1
             if result.get("judge_fallback_called"):
                 summary["judge_fallbacks"] += 1
-            if result.get("judge_gemma_run_count") == 2:
-                summary["judge_gemma_dual_runs"] += 1
-                if result.get("judge_gemma_agreement") is True:
-                    summary["judge_gemma_agreements"] += 1
-                elif result.get("judge_fallback_reason") == "gemma_disagreement":
-                    summary["judge_gemma_disagreements"] += 1
-                elif result.get("judge_fallback_reason") in {"gemma_run_1_invalid", "gemma_run_2_invalid"}:
-                    summary[result["judge_fallback_reason"].replace("gemma_", "judge_gemma_")] += 1
+        for metric_name in (
+            "correctness_primary_26b_calls",
+            "correctness_contract_correction_26b_calls",
+            "correctness_rejudge_26b_calls",
+            "primary_12b_calls",
+            "contract_correction_12b_calls",
+            "fallback_26b_calls",
+            "fallback_reason_contract",
+            "fallback_reason_resolver_mismatch",
+            "http_retry_count",
+            "non_canonical_count",
+            "runtime_count",
+            "correctness_error_type_normalized_count",
+        ):
+            summary[metric_name] += int(result.get(metric_name) or 0)
         anchor = result.get("solution_anchor_result")
         if isinstance(anchor, dict) and anchor.get("resolver_attempt_count"):
             summary["resolver_calls"] += 1
             if anchor.get("resolver_fallback_called"):
                 summary["resolver_fallbacks"] += 1
-            if anchor.get("resolver_gemma_run_count") == 2:
-                summary["resolver_gemma_dual_runs"] += 1
-                if anchor.get("resolver_gemma_agreement") is True:
-                    summary["resolver_gemma_agreements"] += 1
-                elif anchor.get("resolver_fallback_reason") == "gemma_disagreement":
-                    summary["resolver_gemma_disagreements"] += 1
-                elif anchor.get("resolver_fallback_reason") in {"gemma_run_1_invalid", "gemma_run_2_invalid"}:
-                    summary[anchor["resolver_fallback_reason"].replace("gemma_", "resolver_gemma_")] += 1
         for reason in result.get("failed_reason") or []:
             if reason and reason not in failed_reason:
                 failed_reason.append(reason)
@@ -1331,26 +1332,6 @@ def aggregate_generated_question_results(results: list[dict[str, Any]]) -> dict[
     summary["resolver_fallback_rate"] = (
         round(summary["resolver_fallbacks"] / summary["resolver_calls"], 4)
         if summary["resolver_calls"]
-        else 0.0
-    )
-    summary["judge_gemma_disagreement_rate"] = (
-        round(summary["judge_gemma_disagreements"] / summary["judge_gemma_dual_runs"], 4)
-        if summary["judge_gemma_dual_runs"]
-        else 0.0
-    )
-    summary["judge_gemma_agreement_rate"] = (
-        round(summary["judge_gemma_agreements"] / summary["judge_gemma_dual_runs"], 4)
-        if summary["judge_gemma_dual_runs"]
-        else 0.0
-    )
-    summary["resolver_gemma_disagreement_rate"] = (
-        round(summary["resolver_gemma_disagreements"] / summary["resolver_gemma_dual_runs"], 4)
-        if summary["resolver_gemma_dual_runs"]
-        else 0.0
-    )
-    summary["resolver_gemma_agreement_rate"] = (
-        round(summary["resolver_gemma_agreements"] / summary["resolver_gemma_dual_runs"], 4)
-        if summary["resolver_gemma_dual_runs"]
         else 0.0
     )
     return {

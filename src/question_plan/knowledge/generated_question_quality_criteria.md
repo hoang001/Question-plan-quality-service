@@ -1,32 +1,34 @@
-1. Các stage đã được tạo sẵn từ ordered states. Không chia lại, thêm, bớt, sửa hoặc đổi thứ tự stage. Stage `0` là đề bài; stage `1` có thể chỉ viết lại đề bài và vẫn được chấp nhận.
+1. Context bắt buộc đã được Builder và code xử lý trước khi gọi Correctness. Không tự phát hiện hình, bảng, đồ thị hoặc dữ liệu tham chiếu bị thiếu. Không đánh giá answerSpec, expected, options, hints hoặc metadata.
 
-2. Từ stage `1`, kiểm tra từng `bieu_thuc_truoc → bieu_thuc_sau` theo thứ tự:
-   - tự tính lại kết quả số học;
-   - kiểm tra quan hệ suy luận và tính tương đương;
-   - kiểm tra điều kiện áp dụng;
-   - kiểm tra mất nghiệm, thêm nghiệm, thiếu nhánh hoặc thiếu trường hợp;
-   - kiểm tra bước biến đổi cốt lõi bị lược bỏ.
+2. Đọc các transition đúng thứ tự. Kiểm tra `initial premise → first state` trước, sau đó mới kiểm tra các state liền kề. Dừng tại lỗi correctness đầu tiên. Không dùng state phía sau hoặc đáp án cuối để hợp thức hóa lỗi đứng trước.
 
-3. Với mỗi stage, điền `kiem_tra_so_hoc` khi có phép tính; nếu không có phép tính thì đặt `null`. Luôn điền `kiem_tra_lap_luan` và `trang_thai_buoc`.
+3. Một số transition có thể kèm `code_analysis` ở trạng thái `verified_invalid + hard`:
+   - Đây chỉ là cảnh báo số học hoặc tương đương đại số chắc chắn để ưu tiên kiểm tra, không phải verdict.
+   - Correctness Judge phải đọc nguyên văn toàn bộ state, tự kiểm chứng và tự xác định biểu thức bị cảnh báo có được dùng làm tiền đề hoặc kết luận hay không.
+   - Chỉ được bác bỏ cảnh báo khi có bằng chứng rõ ràng trong lời giải rằng biểu thức bị sửa/bác bỏ, hoặc chỉ được trích dẫn/đặt làm giả thiết phản ví dụ và không được dùng cho bước sau.
+   - Nếu không có bằng chứng rõ ràng hoặc biểu thức được dùng tiếp, phải xử lý nó như lỗi correctness.
+   - Transition không có cảnh báo hard phải được đánh giá trực tiếp từ đề bài và lời giải; không suy ra rằng code đã xác nhận đúng.
 
-4. Chỉ kiểm tra stage tiếp theo khi `trang_thai_buoc=true`. Khi gặp `false` đầu tiên, trả stage đó rồi dừng; không trả hoặc nhận xét stage phía sau.
+4. Correctness chỉ đánh giá tính đúng đắn toán học:
+   - phép tính số học, dấu, hệ số, đẳng thức và tính tương đương của phép biến đổi;
+   - công thức, định lý, quy tắc và điều kiện áp dụng;
+   - điều kiện xác định, mất hoặc sinh nghiệm, nghiệm ngoại lai;
+   - thiếu nghiệm, nhánh, trường hợp hoặc điều kiện làm kết luận toán học không đầy đủ;
+   - suy luận logic và việc kết quả cuối có trả lời đúng yêu cầu toán học ban đầu hay không.
 
-5. Không báo lỗi khi chỉ lược bỏ phép tính tiểu tiết có thể kiểm chứng trực tiếp, ví dụ:
-   - `2x^3 + 3 = 19 → 2x^3 = 16`;
-   - `3x = 12 → x = 4`;
-   - không bắt buộc ghi riêng phép tính `19 - 3`.
+5. Không đánh giá mức độ chi tiết sư phạm của lời giải:
+   - Không báo `missing_major_step`; lỗi thiếu bước biến đổi, thiếu diễn giải hoặc khó theo dõi thuộc Process & Presentation Judge.
+   - Không dùng `operation_count`, `max_operations_per_step`, `total_operation_count`, quy tắc one-operation-per-transition hoặc nhãn compressed để chọn verdict.
+   - Không báo lỗi chỉ vì nhiều phép biến đổi nằm trong cùng một content block hoặc cùng một state.
+   - Nếu một biểu thức hoặc trạng thái trung gian đã xuất hiện nguyên văn trong `bieu_thuc_sau`, không được nói rằng biểu thức hoặc trạng thái đó bị thiếu.
+   - Vẫn phải báo lỗi nếu một biểu thức đã viết ra nhưng bản thân phép tính, phép biến đổi hoặc kết luận của nó sai.
 
-6. Đặt `trang_thai_buoc=false` khi thiếu một trạng thái toán học cốt lõi cần thiết để thể hiện lập luận, che mất điều kiện hoặc nhánh nghiệm. Ví dụ, `2x^3 = 16 → x = 2` thiếu trạng thái `x^3 = 8`.
+6. Trước khi chọn trạng thái, bắt buộc tự kiểm chứng độc lập:
+   - Tính lại từng phép tính số học, từng đẳng thức và từng kết quả số xuất hiện trong lời giải; không mặc định đúng chỉ vì lời giải viết trôi chảy hoặc tự nhất quán.
+   - Kiểm tra công thức, định lý và quy tắc được chọn có đúng và có đủ điều kiện áp dụng hay không.
+   - Kiểm tra trạng thái cuối có trả lời đầy đủ đúng yêu cầu ban đầu hay không, kể cả điều kiện xác định, nghiệm, trường hợp, đơn vị và phạm vi kết luận.
+   - Chỉ sau các bước kiểm chứng trên mới chọn `good`, `bad` hoặc `uncertain`. Không dùng answerSpec, expected, options hoặc hints để suy ra kết luận.
 
-7. Báo lỗi tại chính stage làm mất nghiệm hoặc vi phạm điều kiện. Ví dụ:
-   - `x^2 = 4 → x = 2` làm mất nghiệm `x = -2`;
-   - `log_2(x^2) = 2log_2(x)` không hợp lệ nếu chưa có điều kiện `x > 0`.
+7. `good` khi không có lỗi correctness. `bad` khi có lỗi toán học, logic, điều kiện, nghiệm hoặc nhánh chắc chắn. `uncertain` chỉ dùng khi nội dung hiện có không đủ để quyết định một transition mà Builder không coi là context dependency bên ngoài.
 
-8. Chỉ khi mọi stage hợp lệ mới đánh giá chất lượng tổng thể: thiếu kết luận hoặc nhánh quan trọng; đoạn nháp; tự vấn; thử-sai chưa làm sạch; lặp lại hoặc dài dòng nghiêm trọng; cách diễn đạt không phù hợp với học sinh.
-
-9. Kết luận:
-   - `good`: trả đủ mọi stage với `trang_thai_buoc=true`, `reason=""`, `suggestion=""`.
-   - `bad`: có lỗi chắc chắn về toán học, logic, điều kiện, tính đầy đủ hoặc chất lượng.
-   - `uncertain`: dữ liệu không đủ để xác nhận đúng hoặc sai.
-
-Với `bad` hoặc `uncertain`, `reason` và `suggestion` phải có nội dung. Nếu một stage sai, chính stage đó phải có `trang_thai_buoc=false` và `reason`; nếu chỉ có lỗi chất lượng tổng thể thì trả đủ các stage với trạng thái `true`.
+8. Không đánh giá độ dài, lặp lại, đoạn nháp, tự vấn, thử-sai, wording, ký hiệu trình bày, mức độ gộp bước hoặc yêu cầu phải có một câu kết luận riêng. Các vấn đề này thuộc Process & Presentation hoặc Resolver.

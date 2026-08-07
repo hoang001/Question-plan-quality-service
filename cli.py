@@ -29,6 +29,12 @@ def resolve_input_path(input_path: str | None) -> Path:
     return path if path.is_absolute() else ROOT_DIR / path
 
 
+def default_generated_question_report_path(input_path: Path) -> Path:
+    """Keep one default Markdown report per input filename."""
+
+    return Path("results") / f"{input_path.stem}_report.md"
+
+
 def load_json_payload(path: Path) -> Any:
     with path.open("r", encoding="utf-8-sig") as file:
         return json.load(file)
@@ -135,16 +141,6 @@ def format_generated_question_markdown(result: dict[str, Any], *, source_name: s
             "",
         ]
     )
-    if summary.get("judge_gemma_dual_runs") or summary.get("resolver_gemma_dual_runs"):
-        lines[-2:-2] = [
-            "## Định tuyến kiểm tra tính nhất quán của Gemma",
-            "",
-            "| Giai đoạn | Số lượt đánh giá kép | Đồng thuận | Bất đồng | Lượt 1 không hợp lệ | Lượt 2 không hợp lệ | Số lần dùng Qwen | Tỷ lệ đồng thuận | Tỷ lệ dùng Qwen |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-            f"| Đánh giá lời giải | {summary.get('judge_gemma_dual_runs', 0)} | {summary.get('judge_gemma_agreements', 0)} | {summary.get('judge_gemma_disagreements', 0)} | {summary.get('judge_gemma_run_1_invalid', 0)} | {summary.get('judge_gemma_run_2_invalid', 0)} | {summary.get('judge_fallbacks', 0)} | {summary.get('judge_gemma_agreement_rate', 0)} | {summary.get('judge_fallback_rate', 0)} |",
-            f"| Đối chiếu đáp án | {summary.get('resolver_gemma_dual_runs', 0)} | {summary.get('resolver_gemma_agreements', 0)} | {summary.get('resolver_gemma_disagreements', 0)} | {summary.get('resolver_gemma_run_1_invalid', 0)} | {summary.get('resolver_gemma_run_2_invalid', 0)} | {summary.get('resolver_fallbacks', 0)} | {summary.get('resolver_gemma_agreement_rate', 0)} | {summary.get('resolver_fallback_rate', 0)} |",
-            "",
-        ]
     lines.extend(
         [
             "| # | ID | Status | Repair | Issues | Failed Reason | Suggestions |",
@@ -226,9 +222,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def ping_model(client: LLMClient, model: str) -> None:
+    image_url = "https://dev.minio.edumate.ai.vn/edumate-production-v2/images/UHSY_qxuRj_M_bj_ayofRjayayay_qj_fQj__1880/origin.webp"
     response = client.chat_completion(
         model=model,
-        messages=[{"role": "user", "content": "Xin chào"}],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Xin chào, hãy mô tả nội dung của ảnh này bằng tiếng Việt."},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
         temperature=0,
     )
     preview = response["content"].strip().replace("\n", " ")[:1000]
@@ -314,7 +319,10 @@ def main() -> int:
                 workers=args.workers,
             )
             output_path = Path(args.output or "results/generated_question_check_repair_output.json")
-            report_path = Path(args.report_output or "results/generated_question_repair_report.md")
+            report_path = Path(
+                args.report_output
+                or default_generated_question_report_path(input_path)
+            )
             repaired_path = Path(args.repaired_output or "results/generated_question_repaired_objects.json")
             output_path = output_path if output_path.is_absolute() else ROOT_DIR / output_path
             report_path = report_path if report_path.is_absolute() else ROOT_DIR / report_path
