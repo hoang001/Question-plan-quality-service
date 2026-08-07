@@ -19,6 +19,9 @@
 
 - Nếu solution kết luận bằng label, option id hoặc giá trị/nội dung, tự hiểu semantic và map sang option tương ứng.
 - Không dùng regex/code rule; không phụ thuộc một mẫu câu tiếng Việt cố định.
+- Trả `answer_spec_alignment="matched"` khi answerSpec khớp trực tiếp với kết luận solution.
+- Trả `answer_spec_alignment="equivalent"` khi cách biểu diễn khác nhưng tương đương semantic; trường hợp này vẫn đặt `answerSpec_matches_solution=true` và không tạo field fix.
+- Trả `answer_spec_alignment="mismatched"` khi answerSpec thực sự lệch kết luận solution; trường hợp này đặt `answerSpec_matches_solution=false` và tạo field fix/issue căn chỉnh theo các invariant hiện có.
 - Nếu answerSpec lệch canonical, tạo đúng một `solution_anchor_consistency`, intent `align_fields_to_solution`, kèm `fields_to_fix` đến expected hiện có.
 - Nếu answerSpec đã khớp, không tạo issue answer mismatch và không tạo field fix.
 

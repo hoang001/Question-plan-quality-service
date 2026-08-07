@@ -26,13 +26,17 @@ class AppConfig:
     request_timeout_seconds: int
     models_endpoint: str | None
     chat_completions_endpoint: str | None
-    gemma_self_consistency_runs: int
     gemma_evaluation_concurrency: int
     gemma_request_timeout_seconds: int
+    llm_top_p: float
+    solution_splitter_model: str = ""
+    solution_correctness_model: str = ""
+    process_presentation_model: str = ""
+    solution_resolver_model: str = ""
 
 
 def generated_question_reasoning_model(config: AppConfig) -> str:
-    """Model mạnh cho generated question; giữ mapping Qwen ở FALLBACK_JUDGE_MODEL hiện tại."""
+    """Model reasoning fallback cho generated question."""
 
     return str(getattr(config, "fallback_judge_model", "") or config.primary_judge_model)
 
@@ -43,10 +47,40 @@ def generated_question_fast_model(config: AppConfig) -> str:
     return str(config.primary_judge_model)
 
 
-def generated_question_gemma_runs(config: AppConfig | None) -> int:
-    """Số lần Gemma đánh giá độc lập; hỗ trợ đặt 1 để rollback nhanh."""
+def generated_question_splitter_model(config: AppConfig) -> str:
+    """Small model used only to recover canonical solution stages."""
 
-    return max(1, min(int(getattr(config, "gemma_self_consistency_runs", 2)), 2))
+    return str(
+        getattr(config, "solution_splitter_model", "")
+        or config.primary_judge_model
+    )
+
+
+def generated_question_correctness_model(config: AppConfig) -> str:
+    """Authoritative model for every mathematical Correctness decision."""
+
+    return str(
+        getattr(config, "solution_correctness_model", "")
+        or config.primary_judge_model
+    )
+
+
+def generated_question_presentation_model(config: AppConfig) -> str:
+    """Small model for process and presentation only."""
+
+    return str(
+        getattr(config, "process_presentation_model", "")
+        or config.primary_judge_model
+    )
+
+
+def generated_question_resolver_model(config: AppConfig) -> str:
+    """Small model for answer extraction/alignment routing."""
+
+    return str(
+        getattr(config, "solution_resolver_model", "")
+        or config.primary_judge_model
+    )
 
 
 def generated_question_gemma_concurrency(config: AppConfig | None) -> int:
@@ -72,6 +106,16 @@ def env_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer.") from exc
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number.") from exc
+
+
 def load_config(root_dir: Path) -> AppConfig:
     load_dotenv(root_dir / ".env")
     base_url = os.getenv("LLM_BASE_URL", "").strip()
@@ -87,7 +131,15 @@ def load_config(root_dir: Path) -> AppConfig:
         raise ConfigError(f"Missing required env variable(s): {names}. Create .env from .env.example.")
 
     primary = os.getenv("PRIMARY_JUDGE_MODEL", "").strip() or "gemma-4-12b-it"
-    fallback = os.getenv("FALLBACK_JUDGE_MODEL", "").strip() or "qwen3.6-35b"
+    fallback = os.getenv("FALLBACK_JUDGE_MODEL", "").strip() or "gemma-4-26b"
+    splitter = os.getenv("SOLUTION_SPLITTER_MODEL", "").strip() or primary
+    correctness = os.getenv("SOLUTION_CORRECTNESS_MODEL", "").strip() or fallback
+    presentation = os.getenv("PROCESS_PRESENTATION_MODEL", "").strip() or primary
+    resolver = os.getenv("SOLUTION_RESOLVER_MODEL", "").strip() or fallback
+
+    top_p = env_float("LLM_TOP_P", 0.1)
+    if not 0 < top_p <= 1:
+        raise ConfigError("LLM_TOP_P must be greater than 0 and at most 1.")
 
     return AppConfig(
         root_dir=root_dir,
@@ -99,7 +151,11 @@ def load_config(root_dir: Path) -> AppConfig:
         request_timeout_seconds=env_int("REQUEST_TIMEOUT_SECONDS", 60),
         models_endpoint=os.getenv("LLM_MODELS_ENDPOINT", "").strip() or None,
         chat_completions_endpoint=os.getenv("LLM_CHAT_COMPLETIONS_ENDPOINT", "").strip() or None,
-        gemma_self_consistency_runs=env_int("GEMMA_SELF_CONSISTENCY_RUNS", 2),
         gemma_evaluation_concurrency=env_int("GEMMA_EVALUATION_CONCURRENCY", 4),
         gemma_request_timeout_seconds=env_int("GEMMA_REQUEST_TIMEOUT_SECONDS", 30),
+        llm_top_p=top_p,
+        solution_splitter_model=splitter,
+        solution_correctness_model=correctness,
+        process_presentation_model=presentation,
+        solution_resolver_model=resolver,
     )

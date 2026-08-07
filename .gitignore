@@ -7,5 +7,9 @@ results/
 results/outputs/
 results/overview/
 results/quick_check/
+results-*/
+backups/
+data/
 data/ocr-raw/
+docs/assets/solution-evaluation-flow.png
 .pytest_cache/

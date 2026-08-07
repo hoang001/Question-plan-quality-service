@@ -19,9 +19,16 @@ DEFAULT_CHAT_COMPLETIONS_ENDPOINTS = ["/v1/chat/completions", "/chat/completions
 
 
 class ApiError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        *,
+        retry_count: int = 0,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_count = retry_count
 
 
 class LLMClient:
@@ -61,22 +68,53 @@ class LLMClient:
             raise ApiError("Không tìm thấy model id trong response models.")
         return sorted(model_ids)
 
-    def chat_completion(self, model: str, messages: list[dict[str, str]], temperature: float = 0) -> dict[str, Any]:
+    def chat_completion(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float = 0,
+        *,
+        response_format: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+        retry_transient_once: bool = False,
+    ) -> dict[str, Any]:
         payload = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "top_p": self.config.llm_top_p,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if max_tokens is not None:
+            payload["max_tokens"] = max(1, int(max_tokens))
         started_at = time.perf_counter()
-        data, endpoint = self.post_json_with_fallback(
-            self.configured_endpoints(self.config.chat_completions_endpoint, DEFAULT_CHAT_COMPLETIONS_ENDPOINTS),
-            payload,
-            timeout_seconds=(
-                max(1, int(getattr(self.config, "gemma_request_timeout_seconds", 30)))
-                if model == self.config.primary_judge_model
-                else None
-            ),
-        )
+        http_retry_count = 0
+        while True:
+            try:
+                data, endpoint = self.post_json_with_fallback(
+                    self.configured_endpoints(
+                        self.config.chat_completions_endpoint,
+                        DEFAULT_CHAT_COMPLETIONS_ENDPOINTS,
+                    ),
+                    payload,
+                    timeout_seconds=(
+                        max(1, int(getattr(self.config, "gemma_request_timeout_seconds", 30)))
+                        if model == self.config.primary_judge_model
+                        else None
+                    ),
+                )
+                break
+            except ApiError as exc:
+                if (
+                    retry_transient_once
+                    and http_retry_count == 0
+                    and self.is_retryable_gateway_error(exc)
+                ):
+                    http_retry_count = 1
+                    continue
+                exc.retry_count = http_retry_count
+                raise
         latency_seconds = round(time.perf_counter() - started_at, 3)
         return {
             "model": model,
@@ -84,7 +122,23 @@ class LLMClient:
             "latency_seconds": latency_seconds,
             "raw_response": data,
             "content": self.extract_chat_content(data),
+            "http_retry_count": http_retry_count,
         }
+
+    @staticmethod
+    def is_retryable_gateway_error(exc: ApiError) -> bool:
+        if exc.status_code in {502, 503, 504}:
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "connection reset",
+                "connection aborted",
+                "gateway timeout",
+                "gateway time-out",
+            )
+        )
 
     def get_json_with_fallback(self, endpoints: list[str]) -> tuple[Any, str]:
         last_error: ApiError | None = None

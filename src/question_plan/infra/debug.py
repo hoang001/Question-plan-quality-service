@@ -21,7 +21,7 @@ def debug_llm_messages(
     *,
     step: str,
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     debug: bool = False,
 ) -> None:
     """In metadata prompt, không in full nội dung record/prompt."""
@@ -33,16 +33,29 @@ def debug_llm_messages(
         "step": step,
         "model": model,
         "message_count": len(messages),
-        "messages": [
+        "messages": [],
+    }
+    for index, message in enumerate(messages, start=1):
+        content = message.get("content") or ""
+        text_content = "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ) if isinstance(content, list) else str(content)
+        image_count = sum(
+            1
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ) if isinstance(content, list) else 0
+        summary["messages"].append(
             {
                 "index": index,
                 "role": message.get("role", ""),
-                "content_chars": len(str(message.get("content") or "")),
-                "content_lines": str(message.get("content") or "").count("\n") + 1,
+                "content_chars": len(text_content),
+                "content_lines": text_content.count("\n") + 1,
+                "image_count": image_count,
             }
-            for index, message in enumerate(messages, start=1)
-        ],
-    }
+        )
     print("[DEBUG_LLM_PROMPT] " + json.dumps(summary, ensure_ascii=False), file=sys.stderr)
 
 

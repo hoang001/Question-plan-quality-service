@@ -2,4 +2,6 @@ python-dotenv>=1.0.1
 requests>=2.32.3
 fastapi>=0.116.0
 uvicorn>=0.35.0
+sympy>=1.14.0
 pydantic>=2.0.0
+pillow>=11.0.0
