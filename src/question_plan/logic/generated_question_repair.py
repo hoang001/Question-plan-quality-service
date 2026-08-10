@@ -154,9 +154,9 @@ def build_generated_question_scoped_repair_messages(
                 "- clean_solution_reasoning: bỏ thử-sai/tự vấn/đoạn nháp nhưng giữ nguyên final answer; không tự giải lại.\n"
                 "- fix_schema: chỉ patch cấu trúc/render nhỏ và an toàn.\n"
                 "Nếu không đủ context hoặc không có patch an toàn, trả needs_manual_review.\n\n"
-                f"REPAIR RULES:\n{repair_rules_text}\n\n"
-                f"OUTPUT SCHEMA:\n{output_schema_text}\n\n"
-                f"SCOPED PAYLOAD:\n{json.dumps(scoped_payload, ensure_ascii=False, indent=2)}"
+                f"QUY TẮC SỬA:\n{repair_rules_text}\n\n"
+                f"LƯỢC ĐỒ ĐẦU RA:\n{output_schema_text}\n\n"
+                f"DỮ LIỆU TRONG PHẠM VI:\n{json.dumps(scoped_payload, ensure_ascii=False, indent=2)}"
             ),
         },
     ]

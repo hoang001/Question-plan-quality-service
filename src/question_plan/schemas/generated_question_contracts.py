@@ -85,11 +85,27 @@ class VisualContextDescription(ContractModel):
         return self
 
 
+class SolutionStem(ContractModel):
+    """Grounded problem statement used as the initial transition premise."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source_path: str = Field(min_length=1)
+    source_text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def reject_blank_values(self) -> SolutionStem:
+        if not self.source_path.strip() or not self.source_text.strip():
+            raise ValueError("stem fields must not be blank")
+        return self
+
+
 class SolutionSplitOutput(ContractModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     context_requirements: list[ContextRequirement]
     visual_descriptions: list[VisualContextDescription] = Field(default_factory=list)
+    stem: SolutionStem
     states: list[SolutionState]
 
 
@@ -222,28 +238,43 @@ class CorrectnessJudgeOutput(ContractModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     error_type: CorrectnessErrorType | None = Field(
-        description="Null when status is good; required when status is bad."
+        description="Null khi status là good; bắt buộc khi status là bad."
     )
     solution_index: int | None = Field(
         ge=0,
-        description="Null when status is good; otherwise the anchored solution index.",
+        description="Null khi status là good; nếu không thì là chỉ số lời giải được neo.",
     )
     from_order: int | None = Field(
         ge=0,
-        description="Null when status is good or for an initial transition.",
+        description="Null khi status là good hoặc khi đây là transition đầu tiên.",
     )
     to_order: int | None = Field(
         ge=0,
-        description="Null when status is good; required when status is bad.",
+        description="Null khi status là good; bắt buộc khi status là bad.",
     )
     reason: str | None = Field(
-        description="Null when status is good; otherwise at most three sentences."
+        description="Null khi status là good; nếu không thì tối đa ba câu."
     )
     suggestion: str | None = Field(
-        description="Null when status is good; required for bad and at most two sentences."
+        description="Null khi status là good; bắt buộc với bad và tối đa hai câu."
+    )
+    semantic_role: Literal[
+        "asserted_active",
+        "hypothetical",
+        "rejected",
+        "self_corrected",
+        "uncertain",
+    ] | None = Field(
+        description="Vai trò ngữ nghĩa của certificate hard-invalid sớm nhất; nếu không có thì null."
+    )
+    certificate_disposition: Literal["accept", "ignore"] | None = Field(
+        description="Chấp nhận hoặc bỏ qua certificate hard-invalid sớm nhất; nếu không có thì null."
+    )
+    role_evidence: str | None = Field(
+        description="Đoạn lời giải làm bằng chứng cho vai trò ngữ nghĩa; bắt buộc khi bỏ qua certificate."
     )
     status: Literal["good", "bad", "uncertain"] = Field(
-        description="Choose after evaluation. When good, code ignores all preceding fields."
+        description="Chọn sau khi đánh giá. Khi good, code bỏ qua mọi field đứng trước."
     )
 
     @model_validator(mode="after")
@@ -283,6 +314,7 @@ ProcessPresentationErrorType = Literal[
     "presentation_self_contradiction",
     "severe_repetition",
     "excessive_verbosity",
+    "redundant_step",
     "unsuitable_wording",
 ]
 
@@ -311,6 +343,15 @@ class CombinedJudgeCorrectionOutput(ContractModel):
     correctness_to_order: int | None = Field(ge=0)
     correctness_reason: str | None
     correctness_suggestion: str | None
+    correctness_semantic_role: Literal[
+        "asserted_active",
+        "hypothetical",
+        "rejected",
+        "self_corrected",
+        "uncertain",
+    ] | None
+    correctness_certificate_disposition: Literal["accept", "ignore"] | None
+    correctness_role_evidence: str | None
     correctness_status: Literal["good", "bad", "uncertain"]
     process_error_type: ProcessPresentationErrorType | None
     process_solution_index: int | None = Field(ge=0)
