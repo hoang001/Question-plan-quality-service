@@ -777,6 +777,26 @@ def test_both_judge_prompts_contain_output_invariants_and_json_escape_rule():
     assert "missing_major_step" in prompts[1]
 
 
+def test_process_prompt_receives_compressed_transition_candidate_in_vietnamese():
+    generated = cubic_question("Ta có 2x^3 = 16. Suy ra x = 2")
+    ordered = cubic_ordered_solution("Ta có 2x^3 = 16.", " Suy ra x = 2")
+    analyzed = analyze_transition_stages(build_transition_stages(ordered, generated))
+
+    prompt = build_process_presentation_judge_messages(
+        generated,
+        "Presentation rules.",
+        ordered,
+        transition_payload=analyzed,
+    )[-1]["content"]
+
+    assert "ỨNG VIÊN THIẾU BƯỚC" in prompt
+    assert '"số_thao_tác":2' in prompt
+    assert "chia hai vế cho cùng một giá trị" in prompt
+    assert "lấy căn bậc lẻ hai vế" in prompt
+    assert '"có_trạng_thái_trung_gian":false' in prompt
+    assert "Nêu một phần danh sách thao tác vẫn là thiếu bước" in prompt
+
+
 def test_contracts_use_flat_correctness_schema_and_presentation_verdict_last():
     schema = CorrectnessJudgeOutput.model_json_schema()
     assert "discriminator" not in schema

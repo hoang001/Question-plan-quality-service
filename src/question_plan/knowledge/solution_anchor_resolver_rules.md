@@ -4,7 +4,10 @@
 
 - Không kiểm tra solution đúng hay sai về toán học/chuyên môn.
 - Không tự giải lại bài từ instruction/stem.
-- Nếu solution có kết luận đáp án cụ thể với cardinality phù hợp interaction type, mặc định dùng kết luận đó làm canonical.
+- Chỉ dùng một kết luận explicit làm canonical khi solution khẳng định rõ đó là đáp án cuối cho đúng đại lượng/interaction được hỏi và cardinality phù hợp interaction type.
+- Kết luận explicit không bắt buộc có từ “Vậy”; một câu như “cạnh còn lại bằng 25” vẫn là kết luận explicit vì gắn trực tiếp giá trị với đại lượng được hỏi.
+- Không lấy số xuất hiện cuối, số trung gian, giá trị thử, hệ số hoặc kết quả phụ làm canonical chỉ vì nó đứng cuối solution.
+- Nếu không xác định chắc kết luận đang trả lời đúng đại lượng/interaction, trả `needs_manual_review`; không ép đối chiếu answerSpec.
 - Không dùng answerSpec để phủ định hoặc sửa solution.
 - Nếu solution không có kết luận cụ thể, không đoán và trả `needs_manual_review`.
 
@@ -22,6 +25,7 @@
 - Trả `answer_spec_alignment="matched"` khi answerSpec khớp trực tiếp với kết luận solution.
 - Trả `answer_spec_alignment="equivalent"` khi cách biểu diễn khác nhưng tương đương semantic; trường hợp này vẫn đặt `answerSpec_matches_solution=true` và không tạo field fix.
 - Trả `answer_spec_alignment="mismatched"` khi answerSpec thực sự lệch kết luận solution; trường hợp này đặt `answerSpec_matches_solution=false` và tạo field fix/issue căn chỉnh theo các invariant hiện có.
+- Chỉ enforce mismatch sau khi đã xác định chắc explicit final conclusion theo phần Mốc canonical; không dùng quy tắc “số cuối solution khác answerSpec”.
 - Nếu answerSpec lệch canonical, tạo đúng một `solution_anchor_consistency`, intent `align_fields_to_solution`, kèm `fields_to_fix` đến expected hiện có.
 - Nếu answerSpec đã khớp, không tạo issue answer mismatch và không tạo field fix.
 

@@ -175,7 +175,8 @@ def test_presentation_criteria_does_not_require_a_separate_conclusion():
     assert "không được yêu cầu lặp lại thành câu kết luận" in criteria
     assert "thiếu kết luận;" not in criteria
     assert "Với `missing_major_step`" in criteria
-    assert "Viết ngắn nhưng vẫn kiểm chứng trực tiếp được" in criteria
+    assert "từ 2 phép biến đổi trở lên" in criteria
+    assert "chỉ nêu một phần các phép biến đổi cần thiết" in criteria
     assert "phải nêu chính xác suy luận nào bị thiếu" in criteria
     assert "thiếu công thức tổng quát" in criteria
     assert "Không bắt buộc mỗi bước nằm ở content block hay dòng riêng" in criteria

@@ -21,14 +21,9 @@ from ..schemas.generated_question_contracts import CodeTransitionAnalysis
 _RELATION = re.compile(r"(<=|>=|!=|=|<|>)")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
 _UNSAFE_DOMAIN = re.compile(
-    r"(?:\\(?:sqrt|log|ln|sin|cos|tan)|\b(?:sqrt|log|ln|sin|cos|tan)\b|"
-    r"\bcăn\b|\blog\s+cơ\s+số\b)",
-    re.IGNORECASE,
-)
-_SEMANTIC_CUES = re.compile(
-    r"\b(?:có\s+lẽ|thử\s+lại|giả\s+sử|chứng\s+minh|điều\s+kiện|"
-    r"thỏa|kết\s+hợp|tam\s+giác|xác\s+suất|trường\s+hợp|"
-    r"mọi\s+số|đặt\s+P|hoặc|vì|do)\b",
+    r"(?:\\(?:sqrt|log|ln|sin|cos|tan|int)\b|∫|"
+    r"\b(?:sqrt|log|ln|sin|cos|tan)\b|\bcăn\b|\blog\s+cơ\s+số\b|"
+    r"\b(?:nguyên\s+hàm|tích\s+phân|đạo\s+hàm)\b|[A-Za-z]\s*['′])",
     re.IGNORECASE,
 )
 _VARIABLE_DIVISION = re.compile(
@@ -48,7 +43,7 @@ _STANDALONE_NUMERIC_ASSERTION = re.compile(
     \$?\s*
     (?P<expression>
         (?P<left>{_NUMERIC_LITERAL})\s*
-        (?P<operator>[+\-*/:×·÷])\s*
+        (?P<operator>[+\-*/×·÷])\s*
         (?P<right>{_NUMERIC_LITERAL})\s*
         =\s*(?P<actual>{_NUMERIC_LITERAL})
     )
@@ -56,9 +51,8 @@ _STANDALONE_NUMERIC_ASSERTION = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
-_EXPLICIT_STEP_BOUNDARY = re.compile(r"(?:[\r\n]+|[.;](?!\d))")
-_NON_SEQUENTIAL_CHAIN_CUES = re.compile(
-    r"\b(?:hoặc|trường\s+hợp|kiểm\s+tra|thay\s+vào|mặt\s+khác|cách\s+khác)\b",
+_EXPLICIT_STEP_BOUNDARY = re.compile(
+    r"(?:[\r\n]+|[.;](?!\d)|,\s*(?=(?:sau\s+đó|tiếp\s+theo)\b))",
     re.IGNORECASE,
 )
 _TRANSLATION = str.maketrans(
@@ -71,6 +65,16 @@ _TRANSLATION = str.maketrans(
         "÷": "/",
         "≤": "<=",
         "≥": ">=",
+        "⁰": "^0",
+        "¹": "^1",
+        "²": "^2",
+        "³": "^3",
+        "⁴": "^4",
+        "⁵": "^5",
+        "⁶": "^6",
+        "⁷": "^7",
+        "⁸": "^8",
+        "⁹": "^9",
         "[": "(",
         "]": ")",
         "\u00a0": " ",
@@ -225,7 +229,21 @@ def _standalone_numeric_assertion(
         expected = left / right
     actual = _fraction_literal(match.group("actual"))
     if expected == actual:
-        return None
+        return _MandatoryArithmeticFinding(
+            evidence_text=match.group("expression"),
+            expected_result=_format_fraction(expected),
+            actual_result=match.group("actual"),
+            analysis=_analysis(
+                "verified_valid",
+                "numeric_calculation",
+                operation_count=1,
+                operation_types=["evaluate_single_numeric_operation"],
+                reason=(
+                    "Mệnh đề số học độc lập có đúng một phép tính và kết quả "
+                    "khớp kết quả code tính chính xác."
+                ),
+            ),
+        )
     return _MandatoryArithmeticFinding(
         evidence_text=match.group("expression"),
         expected_result=_format_fraction(expected),
@@ -298,10 +316,15 @@ def _parse_candidate(raw: str, start: int, end: int) -> _Claim:
     return _Claim(raw, normalized, expressions, relations, symbols, start, end)
 
 
-def _extract_claim(value: str) -> _Claim:
+def _extract_claim(
+    value: str,
+    *,
+    allow_numeric_fragment: bool = False,
+) -> _Claim:
     text = str(value or "").replace("\n", " ")
     tokens = list(re.finditer(r"\S+", text))
     candidates: dict[str, _Claim] = {}
+    failed_relational_candidates: list[tuple[int, int, int]] = []
     saw_unsupported = False
     for start_index in range(len(tokens)):
         for end_index in range(start_index + 1, len(tokens) + 1):
@@ -317,8 +340,14 @@ def _extract_claim(value: str) -> _Claim:
                 claim = _parse_candidate(raw, start, end)
             except _Unsupported:
                 saw_unsupported = True
+                relation_count = len(_RELATION.findall(_normalize_math(raw)))
+                if relation_count:
+                    failed_relational_candidates.append((start, end, relation_count))
                 continue
             except _ParseError:
+                relation_count = len(_RELATION.findall(_normalize_math(raw)))
+                if relation_count:
+                    failed_relational_candidates.append((start, end, relation_count))
                 continue
             if not claim.relations and not claim.symbols:
                 continue
@@ -350,6 +379,19 @@ def _extract_claim(value: str) -> _Claim:
         reverse=True,
     )
     best = ranked[0]
+    if any(
+        failed_start <= best.start
+        and failed_end >= best.end
+        and failed_relation_count > len(best.relations)
+        for failed_start, failed_end, failed_relation_count in failed_relational_candidates
+    ) and not (
+        allow_numeric_fragment
+        and best.relations == ("=",)
+        and not best.symbols
+    ):
+        raise _Unsupported(
+            "Math claim đầy đủ nằm ngoài verifier; không hard-verify fragment làm mất quan hệ."
+        )
     if len(ranked) > 1:
         first_score = (len(best.relations), len(best.normalized), best.start)
         second = ranked[1]
@@ -363,13 +405,11 @@ def _extract_explicit_ordered_claims(value: str) -> list[_Claim]:
     """Extract one unambiguous claim from each explicit text step.
 
     Sentence, newline and semicolon boundaries are intentionally required.
-    A comma or a verbal connector alone may introduce an alternative, a check
-    or an example rather than a sequential solution state.
+    A comma is accepted only with an explicit ordered connector such as
+    ``sau đó`` or ``tiếp theo``; other commas may introduce alternatives.
     """
 
     text = str(value or "")
-    if _NON_SEQUENTIAL_CHAIN_CUES.search(text):
-        return []
     segments = [
         segment.strip()
         for segment in _EXPLICIT_STEP_BOUNDARY.split(text)
@@ -770,6 +810,9 @@ def analyze_code_transition(*, before: str, after: str) -> dict[str, Any]:
     try:
         raw_before = str(before or "")
         raw_after = str(after or "")
+        standalone_finding = _standalone_numeric_assertion(raw_after)
+        if standalone_finding is not None:
+            return standalone_finding.analysis
         raw_transition = raw_before + "\n" + raw_after
         if _DIVISION_BY_ZERO.search(raw_after):
             return _analysis(
@@ -782,13 +825,14 @@ def analyze_code_transition(*, before: str, after: str) -> dict[str, Any]:
             raise _Unsupported("Transition chứa căn, log hoặc hàm ngoài phạm vi an toàn.")
         if _VARIABLE_DIVISION.search(raw_transition):
             raise _Unsupported("Phép chia cho biểu thức chứa biến cần Gemma kiểm tra điều kiện.")
-        if _SEMANTIC_CUES.search(raw_before) or _SEMANTIC_CUES.search(raw_after):
-            raise _Unsupported("Transition chứa suy luận ngôn ngữ hoặc điều kiện semantic.")
         explicit_chain = _analyze_explicit_claim_chain(raw_before, raw_after)
         if explicit_chain is not None:
             return explicit_chain
         before_claim = _extract_claim(before)
-        after_claim = _extract_claim(after)
+        after_claim = _extract_claim(
+            after,
+            allow_numeric_fragment=_is_simple_numeric_assignment(before_claim),
+        )
         all_relations = before_claim.relations + after_claim.relations
         has_inequality = any(relation in {"<", "<=", ">", ">="} for relation in all_relations)
         has_equality = bool(before_claim.relations or after_claim.relations)
@@ -812,10 +856,13 @@ def analyze_code_transition(*, before: str, after: str) -> dict[str, Any]:
                 from sympy import simplify
 
                 source = before_claim.parts[0]
-                if (
-                    simplify(source - after_claim.parts[0]) != 0
-                    or simplify(source - after_claim.parts[1]) != 0
-                ):
+                source_matches_left = simplify(source - after_claim.parts[0]) == 0
+                source_matches_right = simplify(source - after_claim.parts[1]) == 0
+                if not source_matches_left and not source_matches_right:
+                    raise _Unsupported(
+                        "Không có verifier chứng minh đẳng thức sau là phép rút gọn của biểu thức nguồn."
+                    )
+                if simplify(after_claim.parts[0] - after_claim.parts[1]) != 0:
                     return _analysis(
                         "verified_invalid",
                         "expression_transformation",
@@ -842,6 +889,13 @@ def analyze_code_transition(*, before: str, after: str) -> dict[str, Any]:
                 )
             if _is_simple_numeric_assignment(before_claim) and not after_claim.symbols:
                 transition_type = "numeric_substitution"
+                variable = before_claim.symbols[0]
+                assignment_value = _simple_assignment_value(before_claim, variable)
+                assignment_text = f"{variable}={assignment_value}"
+                if assignment_value is None or assignment_text not in _normalize_math(raw_after):
+                    raise _Unsupported(
+                        "Verifier thế số yêu cầu state sau lặp lại đúng assignment nguồn."
+                    )
                 if not _numeric_chain_valid(after_claim):
                     return _analysis(
                         "verified_invalid",
@@ -902,6 +956,14 @@ def analyze_code_transition(*, before: str, after: str) -> dict[str, Any]:
                 else _operation_count(before_claim, after_claim)
             )
         else:
+            if (
+                tuple(str(symbol) for symbol in before_claim.symbols)
+                != tuple(str(symbol) for symbol in after_claim.symbols)
+                or len(before_claim.symbols) != 1
+            ):
+                raise _Unsupported(
+                    "Không có verifier biểu thức cho transition đổi tập biến hoặc không có đúng một biến."
+                )
             transition_type = (
                 "numeric_calculation"
                 if not before_claim.symbols and not after_claim.symbols
@@ -973,8 +1035,8 @@ def analyze_transition_stages(stage_payload: dict[str, Any]) -> dict[str, Any]:
     for stage in stages:
         if not isinstance(stage, dict):
             raise ValueError("Mỗi transition phải là object canonical.")
-        before = stage.get("bieu_thuc_truoc")
-        after = stage.get("bieu_thuc_sau")
+        before = stage.get("_math_before", stage.get("bieu_thuc_truoc"))
+        after = stage.get("_math_after", stage.get("bieu_thuc_sau"))
         if not isinstance(before, str) or not isinstance(after, str):
             raise ValueError("Transition thiếu before/after dạng text.")
         mandatory_finding = _standalone_numeric_assertion(after)
@@ -983,8 +1045,16 @@ def analyze_transition_stages(stage_payload: dict[str, Any]) -> dict[str, Any]:
             if mandatory_finding is not None
             else analyze_code_transition(before=before, after=after)
         )
-        analyzed_stage = {**stage, "code_analysis": analysis}
-        if mandatory_finding is not None:
+        analyzed_stage = {
+            key: value
+            for key, value in stage.items()
+            if key not in {"_math_before", "_math_after"}
+        }
+        analyzed_stage["code_analysis"] = analysis
+        if (
+            mandatory_finding is not None
+            and mandatory_finding.analysis.get("status") == "verified_invalid"
+        ):
             analyzed_stage["mandatory_code_issue"] = {
                 "evidence_text": mandatory_finding.evidence_text,
                 "expected_result": mandatory_finding.expected_result,

@@ -54,7 +54,7 @@ VALID_INTENTS = {
     "needs_manual_review",
 }
 OPTION_INTERACTION_TYPES = {"single_choice", "multiple_choice", "choice_blank_fill", "matching"}
-RESOLVER_OUTPUT_INVARIANTS = """OUTPUT INVARIANTS:
+RESOLVER_OUTPUT_INVARIANTS = """ĐIỀU KIỆN BẤT BIẾN CỦA ĐẦU RA:
 - `final_answer` bắt buộc phải là một JSON object; không được là string, array hoặc null.
 - `final_answer` phải có bốn field semantic: `text`, `matched_option_id`, `correctOptionIds`, `expected`; không được bỏ bất kỳ field semantic nào.
 - `final_answer.text` bắt buộc phải tồn tại và phải là JSON string.
@@ -230,14 +230,16 @@ def build_solution_anchor_resolver_messages(
             "role": "user",
             "content": (
                 "Áp dụng đúng rules/schema. Nhiều số, phương trình hoặc option trung gian không phải nhiều đáp án cuối. "
+                "Chỉ đối chiếu answerSpec với một kết luận explicit mà solution khẳng định là đáp án cuối cho đúng đại lượng/interaction được hỏi; "
+                "không dùng số xuất hiện cuối như một heuristic. Kết luận explicit không bắt buộc có từ 'Vậy'. "
                 "Chỉ resolve các interaction_contexts được cung cấp; bỏ qua mọi phần solution thuộc câu essay hoặc context đã bị loại. "
                 "single_choice chỉ needs_manual_review khi kết luận cuối thật sự có nhiều đáp án; multiple_choice được "
                 "phép có nhiều đáp án. Nếu không có kết luận cụ thể, không đoán và không đề xuất sửa answerSpec/options/hints. "
                 "Generic Quality Judge sẽ xử lý dài dòng/thử-sai/tự vấn khi final answer vẫn rõ, nên resolver không emit "
                 "trùng lỗi trình bày đó. Mọi reason/suggestion phải là tiếng Việt có dấu.\n\n"
-                f"RESOLVER RULES:\n{rules_text}\n\n"
-                f"OUTPUT SCHEMA:\n{output_schema_text}\n\n"
-                f"DYNAMIC PAYLOAD:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+                f"QUY TẮC RESOLVER:\n{rules_text}\n\n"
+                f"LƯỢC ĐỒ ĐẦU RA:\n{output_schema_text}\n\n"
+                f"DỮ LIỆU ĐỘNG:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
                 f"{RESOLVER_OUTPUT_INVARIANTS}\n"
                 "Chỉ trả một JSON object đúng schema: không thêm field, không bỏ field bắt buộc, "
                 "dùng null thay vì chuỗi \"None\", enum đúng giá trị trong schema, không markdown. "

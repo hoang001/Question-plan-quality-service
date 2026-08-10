@@ -39,7 +39,7 @@ from .generated_question_schema import (
     fail_closed_output,
     normalize_generated_question_result,
 )
-from .code_transition_analyzer import analyze_transition_stages
+from .code_transition_analyzer import analyze_code_transition, analyze_transition_stages
 
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
@@ -58,10 +58,15 @@ CORRECTNESS_OUTPUT_INVARIANTS = """### ĐIỀU KIỆN BẤT BIẾN CỦA ĐẦU 
 - status="good": error_type, solution_index, from_order, to_order, reason, suggestion đều là JSON null.
 - status="bad": error_type, solution_index, to_order, reason, suggestion bắt buộc; from_order chỉ null cho initial_transition.
 - status="uncertain": reason bắt buộc; các field lỗi/anchor khác có thể null.
+- Không có `verified_invalid + hard`: semantic_role, certificate_disposition, role_evidence đều null.
+- Có `verified_invalid + hard`: semantic_role và certificate_disposition bắt buộc mô tả certificate sớm nhất.
+- asserted_active hoặc uncertain dùng certificate_disposition="accept".
+- hypothetical, rejected hoặc self_corrected dùng certificate_disposition="ignore" và role_evidence nguyên văn bắt buộc.
 - Chỉ trả quyết định semantic; không trả location, source_path, evidence_text, before, after hoặc code_analysis review.
 - Không dùng chuỗi "None", "null" hoặc "N/A" thay cho JSON null."""
 PROCESS_PRESENTATION_OUTPUT_INVARIANTS = """### ĐIỀU KIỆN BẤT BIẾN CỦA ĐẦU RA
-- Nếu verdict="good": ưu tiên error_type=null, solution_index=null, state_order=null, reason="", suggestion=""; code sẽ bỏ qua nhận xét thừa và canonical hóa kết quả good.
+- Nếu verdict="good" và không có advisory: error_type=null, solution_index=null, state_order=null, reason="", suggestion="".
+- Chỉ `redundant_step` được phép đi cùng verdict="good": phải có solution_index, state_order, reason và suggestion để code ghi nhận advisory nội bộ nhưng không làm lời giải thành bad.
 - Nếu verdict="bad" hoặc verdict="uncertain": error_type, solution_index, reason và suggestion bắt buộc; state_order=null chỉ khi lỗi áp dụng cho toàn solution.
 - Không trả source_path, evidence_text hoặc scope; code tự dựng các metadata này từ anchor đã validate.
 - Không dùng chuỗi "None", "null" hoặc "N/A" thay cho giá trị JSON; dùng JSON null hoặc "" đúng theo schema."""
@@ -70,7 +75,7 @@ FIRST_TRANSITION_RULE = """### QUY TẮC BƯỚC CHUYỂN ĐẦU TIÊN
 - Nếu lỗi đầu tiên ở initial transition, trả `from_order=null` và `to_order` của first state.
 - Evidence phải nằm nguyên văn trong first state.
 - Không dùng state phía sau để hợp thức hóa lỗi đứng trước.
-- Đọc `code_analysis` như tín hiệu advisory để ưu tiên vị trí cần kiểm tra; không sao chép annotation vào output."""
+- `code_analysis` là certificate toán học; chỉ xác định vai trò ngữ nghĩa của bước bị cảnh báo, không phản biện lại phép toán."""
 CODE_SPLITTER_MAX_TOKENS = 160
 _TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 _BOUNDARY_PATTERNS = (
@@ -79,6 +84,34 @@ _BOUNDARY_PATTERNS = (
     re.compile(r"[.!?;:,]+(?:[\"'»”)\]]*)\s+"),
     re.compile(r"\b(?:Suy ra|Do đó|Vậy|Khi đó|Ta có|Tiếp theo|Mặt khác)\b", re.IGNORECASE),
 )
+_SPLITTER_DIVISION_COLON = re.compile(
+    r"(?<=[0-9)\]}])\s*:\s*(?=[+\-]?\s*(?:\d|[({\[]|\\(?:d?frac|sqrt)))"
+    r"|(?<=[A-Za-z])\s*:\s*(?=[+\-]?\s*(?:\d|[({\[]))"
+    r"|(?<=[)\]}])\s*:\s*(?=[A-Za-z])"
+)
+_ASSIGNMENT_BEFORE_COLON = re.compile(
+    r"[A-Za-z_][A-Za-z_0-9]*\s*=\s*[+\-]?\s*(?:\d+(?:[.,]\d+)?|\.\d+)\s*$"
+)
+_NUMBERED_LABEL_BEFORE_COLON = re.compile(
+    r"\b(?:bước|câu|ý|lần|ví\s+dụ)\s+\d+\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_splitter_division(text: str) -> str:
+    """Chuẩn hóa dấu chia trong bản phân tích, không sửa văn bản nguồn."""
+
+    source = str(text or "")
+
+    def replace_colon(match: re.Match[str]) -> str:
+        prefix = source[: match.start()]
+        if _ASSIGNMENT_BEFORE_COLON.search(prefix):
+            return match.group(0)
+        if _NUMBERED_LABEL_BEFORE_COLON.search(prefix):
+            return match.group(0)
+        return "/"
+
+    return _SPLITTER_DIVISION_COLON.sub(replace_colon, source)
 
 
 class _RuntimeFailureDetail(str):
@@ -282,6 +315,22 @@ def compact_generated_question_payload(
     return payload
 
 
+def _context_text_sources(payload: dict[str, Any]) -> dict[str, str]:
+    sources = {
+        f"/instruction/{index}/text": str(block["text"])
+        for index, block in enumerate(payload.get("instruction") or [])
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    }
+    for item in payload.get("questionItems") or []:
+        if not isinstance(item, dict):
+            continue
+        item_index = int(item.get("index") or 0)
+        for block_index, block in enumerate(item.get("stem") or []):
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                sources[f"/questionItems/{item_index}/stem/{block_index}/text"] = str(block["text"])
+    return sources
+
+
 def validate_splitter_output(
     parsed: Any,
     generated_question: dict[str, Any],
@@ -297,6 +346,12 @@ def validate_splitter_output(
         "instruction": payload.get("instruction") or [],
         "questionItems": payload.get("questionItems") or [],
     }
+    context_sources = _context_text_sources(payload)
+    stem = split["stem"]
+    if stem["source_path"] not in context_sources:
+        return None, "stem.source_path does not exist in instruction or questionItems[].stem."
+    if stem["source_text"] != context_sources[stem["source_path"]]:
+        return None, "stem.source_text does not exactly match the question context."
     expected_visuals = {
         (reference.source_path, reference.source)
         for reference in extract_asset_references(question_context)
@@ -316,17 +371,7 @@ def validate_splitter_output(
             "trong question context."
         )
 
-    context_texts = [
-        str(block["text"])
-        for block in payload.get("instruction") or []
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    ]
-    context_texts.extend(
-        str(block["text"])
-        for item in payload.get("questionItems") or []
-        for block in item.get("stem") or []
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    )
+    context_texts = list(context_sources.values())
     for requirement in split["context_requirements"]:
         if not any(
             _normalized_evidence_in_source(
@@ -374,6 +419,8 @@ def validate_splitter_output(
         ranks = [path_ranks[state["source_path"]][1] for state in states]
         if ranks != sorted(ranks):
             return None, f"Splitter đã thay đổi thứ tự solution block của solution {solution_index}."
+    for state in split["states"]:
+        state["_math_text"] = _normalize_splitter_division(state["source_text"])
     return split, ""
 
 
@@ -432,8 +479,12 @@ def split_solution_with_code(
                 order += 1
     if not states:
         return None, "Code splitter không tìm thấy solution text."
+    stem = _problem_anchor(payload)
+    if stem is None:
+        return None, "Code splitter không tìm thấy instruction hoặc question stem."
+    stem["source_text"] = _context_text_sources(payload)[stem["source_path"]]
     return validate_splitter_output(
-        {"context_requirements": [], "states": states},
+        {"context_requirements": [], "stem": stem, "states": states},
         generated_question,
     )
 
@@ -479,6 +530,7 @@ def build_solution_splitter_messages(generated_question: dict[str, Any]) -> list
         "instruction": payload.get("instruction") or [],
         "questionItems": payload.get("questionItems") or [],
     }
+    context_text_sources = _context_text_sources(payload)
     visual_descriptions = extract_textual_visual_descriptions(question_context)
     messages = [
         {
@@ -493,7 +545,7 @@ def build_solution_splitter_messages(generated_question: dict[str, Any]) -> list
         {
             "role": "user",
             "content": (
-                "### CONTEXT REQUIREMENT ANALYSIS\n"
+                "### PHÂN TÍCH YÊU CẦU NGỮ CẢNH\n"
                 "Trước khi chia solution, xác định đề có phụ thuộc dữ liệu bổ sung bắt buộc để kiểm chứng lời giải "
                 "hay không. Dữ liệu có thể là hình vẽ, hình học, đồ thị, biểu đồ, bảng số liệu, bảng biến thiên, "
                 "trục số, hệ trục tọa độ, sơ đồ, vùng tô màu, dữ liệu trực quan hoặc dữ liệu tham chiếu khác.\n"
@@ -511,10 +563,10 @@ def build_solution_splitter_messages(generated_question: dict[str, Any]) -> list
                 "không được trả missing/insufficient chỉ vì cùng Markdown còn có URL. Chỉ trả insufficient khi mô tả text "
                 "vẫn thiếu dữ kiện bắt buộc và không có image_url đính kèm có thể đọc (hoặc ảnh đính kèm thực sự không đọc được). "
                 "Bài hình học đủ dữ kiện bằng text và không phụ thuộc hình minh họa nên trả "
-                "context_requirements=[]. evidence_text phải là đoạn nguyên văn trong QUESTION CONTEXT thể hiện "
+                "context_requirements=[]. evidence_text phải là đoạn nguyên văn trong NGỮ CẢNH CÂU HỎI thể hiện "
                 "sự phụ thuộc. Nếu không có dependency bổ sung bắt buộc, trả context_requirements=[].\n"
                 "Không trả verdict, context_issue, is_good, error_type hoặc suggestion; không đánh giá solution.\n\n"
-                "### VISUAL DESCRIPTION\n"
+                "### MÔ TẢ DỮ LIỆU TRỰC QUAN\n"
                 "Với mỗi phần image_url được đính kèm, bắt buộc trả đúng một phần tử visual_descriptions. "
                 "Sao chép chính xác source_path và asset_url từ manifest ảnh. description phải mô tả bằng tiếng Việt "
                 "những gì thực sự nhìn thấy và đủ chi tiết để Judge phía sau kiểm chứng bài: loại hình/bảng/đồ thị, "
@@ -522,15 +574,29 @@ def build_solution_splitter_messages(generated_question: dict[str, Any]) -> list
                 "Không tự giải bài, không suy đoán phần không nhìn rõ. Nếu không đọc được ảnh, đặt description đúng bằng "
                 "'Không thể đọc nội dung ảnh.' và trả context requirement insufficient tương ứng; flow sẽ dừng trước Correctness. "
                 "Nếu không có ảnh đính kèm, trả visual_descriptions=[].\n\n"
-                "### STATE SPLITTING\n"
-                "Chỉ trả context_requirements, visual_descriptions và states. Mỗi source_text phải là một lát cắt nguyên văn của đúng source_path. "
+                "### TÁCH TRẠNG THÁI\n"
+                "Chỉ trả context_requirements, visual_descriptions, stem và states. "
+                "stem là đề bài hoặc dữ liệu trực tiếp mà lời giải đang giải, lấy nguyên văn từ instruction hoặc "
+                "questionItems[].stem; source_path phải tồn tại và source_text phải khớp chính xác. "
+                "Sao chép nguyên cặp source_path/source_text từ NGUỒN VĂN BẢN NGỮ CẢNH; source_path phải là JSON Pointer "
+                "bắt đầu bằng '/instruction/' hoặc '/questionItems/', không dùng dạng questionItems[0].stem[0]. "
+                "Nếu instruction chứa phương trình/dữ kiện đầy đủ còn questionItems[].stem chỉ yêu cầu nhập hoặc chọn đáp án, "
+                "chọn instruction làm stem. "
+                "stem không phải là một solution state. Mỗi states.source_text phải là một lát cắt nguyên văn của đúng solution source_path. "
                 "Trong từng solution, order bắt đầu từ 0 và liên tục qua các text block theo thứ tự gốc. "
                 "Khi ghép source_text của các state thuộc cùng source_path theo order, kết quả phải giống tuyệt đối "
-                "text gốc từng ký tự. Không trả transitions và không bỏ qua solution block.\n\n"
-                f"JSON SCHEMA:\n{contract_schema_text(SolutionSplitOutput)}\n\n"
-                f"QUESTION CONTEXT:\n{json.dumps(question_context, ensure_ascii=False, indent=2)}\n\n"
-                f"TEXTUAL VISUAL DESCRIPTIONS:\n{json.dumps(visual_descriptions, ensure_ascii=False, indent=2)}\n\n"
-                f"SOLUTION PAYLOAD:\n{json.dumps(payload.get('solutions') or [], ensure_ascii=False, indent=2)}\n\n"
+                "text gốc từng ký tự. Không trả transitions và không bỏ qua solution block.\n"
+                "Dấu phẩy có thể là ranh giới state khi nó phân cách các bước lập luận độc lập. Ví dụ "
+                "'Ta có 2x^3 = 18, x^3 = 8, suy ra x = 2.' nên được tách thành "
+                "'Ta có 2x^3 = 18,', ' x^3 = 8,', ' suy ra x = 2.'. "
+                "Phải giữ nguyên dấu phẩy và khoảng trắng; không thay dấu phẩy bằng dấu chấm phẩy. "
+                "Không tách dấu phẩy trong số thập phân như 3,12; tọa độ/biểu thức như A(1, 2), "
+                "(x,y)=(2,3), f(x,y); hoặc khoảng như [1,5]. Chỉ tách khi ngữ nghĩa xác nhận đó là ranh giới chuyển bước.\n\n"
+                f"LƯỢC ĐỒ JSON:\n{contract_schema_text(SolutionSplitOutput)}\n\n"
+                f"NGỮ CẢNH CÂU HỎI:\n{json.dumps(question_context, ensure_ascii=False, indent=2)}\n\n"
+                f"NGUỒN VĂN BẢN NGỮ CẢNH:\n{json.dumps(context_text_sources, ensure_ascii=False, indent=2)}\n\n"
+                f"MÔ TẢ TRỰC QUAN BẰNG VĂN BẢN:\n{json.dumps(visual_descriptions, ensure_ascii=False, indent=2)}\n\n"
+                f"DỮ LIỆU LỜI GIẢI:\n{json.dumps(payload.get('solutions') or [], ensure_ascii=False, indent=2)}\n\n"
                 "Chỉ trả một JSON object đúng schema: không thêm field, không bỏ field bắt buộc, "
                 "dùng null thay vì chuỗi \"None\", và không trả nội dung ngoài JSON."
             ),
@@ -557,6 +623,32 @@ def _problem_anchor(payload: dict[str, Any]) -> dict[str, str] | None:
         key=lambda item: (item["source_text"].count("="), len(item["source_text"])),
         default=None,
     )
+
+
+def _transition_premise(
+    ordered_solution: dict[str, Any],
+    generated_question: dict[str, Any],
+) -> dict[str, str] | None:
+    payload = compact_generated_question_payload(generated_question)
+    sources = _context_text_sources(payload)
+    stem = ordered_solution.get("stem")
+    if isinstance(stem, dict):
+        source_path = stem.get("source_path")
+        source_text = stem.get("source_text")
+        if (
+            isinstance(source_path, str)
+            and isinstance(source_text, str)
+            and sources.get(source_path) == source_text
+        ):
+            return {
+                "source_path": source_path,
+                "source_text": source_text,
+                "_math_text": _normalize_splitter_division(source_text),
+            }
+    fallback = _problem_anchor(payload)
+    if fallback is not None:
+        fallback["_math_text"] = _normalize_splitter_division(fallback["source_text"])
+    return fallback
 
 
 def build_context_issue_from_requirements(
@@ -653,7 +745,7 @@ _CORRECTNESS_HARD_ANALYSIS_FIELDS = (
 
 
 def _correctness_prompt_stage(stage: dict[str, Any]) -> dict[str, Any]:
-    """Expose only hard-invalid arithmetic advice to Correctness.
+    """Expose hard deterministic math certificates to Correctness.
 
     Operation counts and compression annotations are intentionally withheld: they
     belong to pedagogical completeness, which is judged independently by Process.
@@ -667,7 +759,7 @@ def _correctness_prompt_stage(stage: dict[str, Any]) -> dict[str, Any]:
     analysis = stage.get("code_analysis")
     if (
         isinstance(analysis, dict)
-        and analysis.get("status") == "verified_invalid"
+        and analysis.get("status") in {"verified_valid", "verified_invalid"}
         and analysis.get("strength") == "hard"
     ):
         prompt_stage["code_analysis"] = {
@@ -676,6 +768,247 @@ def _correctness_prompt_stage(stage: dict[str, Any]) -> dict[str, Any]:
             if analysis.get(name) is not None
         }
     return prompt_stage
+
+
+def _hard_valid_process_certificates(
+    transition_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Chỉ đưa metadata cần thiết cho Process, không yêu cầu model tính lại toán."""
+
+    return [
+        {
+            "solution_index": int(stage["solution_index"]),
+            "from_order": stage["from_order"],
+            "to_order": int(stage["to_order"]),
+            "status": "verified_valid",
+            "strength": "hard",
+        }
+        for stage in (transition_payload or {}).get("stages") or []
+        if isinstance(stage, dict)
+        and isinstance(stage.get("code_analysis"), dict)
+        and stage["code_analysis"].get("status") == "verified_valid"
+        and stage["code_analysis"].get("strength") == "hard"
+    ]
+
+
+_PROCESS_OPERATION_LABELS = {
+    "add_same_value_both_sides": "cộng cùng một giá trị vào hai vế",
+    "subtract_same_value_both_sides": "trừ cùng một giá trị ở hai vế",
+    "multiply_both_sides": "nhân hai vế với cùng một giá trị",
+    "divide_both_sides": "chia hai vế cho cùng một giá trị",
+    "take_odd_root_both_sides": "lấy căn bậc lẻ hai vế",
+    "expand_power": "khai triển lũy thừa",
+    "distribute_coefficient": "phân phối hệ số",
+    "combine_constant_terms": "thu gọn các hạng tử hằng",
+    "simplify_expression": "rút gọn biểu thức",
+}
+
+
+def _compressed_process_candidates(
+    transition_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Đưa bằng chứng bước bị nén cho Process mà không tự kết luận thiếu bước."""
+
+    candidates: list[dict[str, Any]] = []
+    for stage in (transition_payload or {}).get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        analysis = stage.get("code_analysis")
+        if not isinstance(analysis, dict):
+            continue
+        if (
+            analysis.get("status") != "compressed_but_equivalent"
+            or analysis.get("strength") != "soft"
+        ):
+            continue
+        operation_types = analysis.get("operation_types") or []
+        candidates.append(
+            {
+                "chỉ_số_lời_giải": int(stage["solution_index"]),
+                "bước_trước": stage.get("from_order"),
+                "bước_sau": int(stage["to_order"]),
+                "số_thao_tác": analysis.get("operation_count"),
+                "các_thao_tác": [
+                    _PROCESS_OPERATION_LABELS.get(str(name), str(name))
+                    for name in operation_types
+                ],
+                "có_trạng_thái_trung_gian": bool(
+                    analysis.get("intermediate_states_explicit")
+                ),
+                "nhận_định": str(analysis.get("reason") or ""),
+            }
+        )
+    return candidates
+
+
+def _redundant_state_candidates(
+    ordered_solution: dict[str, Any],
+    transition_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Tìm state giữa có thể bỏ bằng một bypass hard-valid của Analyzer."""
+
+    stages = (transition_payload or {}).get("stages") or []
+    states = [state for state in ordered_solution.get("states") or [] if isinstance(state, dict)]
+    candidates: list[dict[str, Any]] = []
+    for current in states:
+        solution_index = int(current["solution_index"])
+        order = int(current["order"])
+        if order <= 0:
+            continue
+        previous = next(
+            (
+                state
+                for state in states
+                if int(state["solution_index"]) == solution_index
+                and int(state["order"]) == order - 1
+            ),
+            None,
+        )
+        following = next(
+            (
+                state
+                for state in states
+                if int(state["solution_index"]) == solution_index
+                and int(state["order"]) == order + 1
+            ),
+            None,
+        )
+        incoming = next(
+            (
+                stage
+                for stage in stages
+                if int(stage["solution_index"]) == solution_index
+                and stage["from_order"] == order - 1
+                and int(stage["to_order"]) == order
+            ),
+            None,
+        )
+        outgoing = next(
+            (
+                stage
+                for stage in stages
+                if int(stage["solution_index"]) == solution_index
+                and stage["from_order"] == order
+                and int(stage["to_order"]) == order + 1
+            ),
+            None,
+        )
+        if previous is None or following is None or incoming is None or outgoing is None:
+            continue
+        incoming_analysis = incoming.get("code_analysis") or {}
+        outgoing_analysis = outgoing.get("code_analysis") or {}
+        if not (
+            incoming_analysis.get("status") == "verified_valid"
+            and incoming_analysis.get("strength") == "hard"
+        ):
+            continue
+        if (
+            outgoing_analysis.get("status") == "verified_invalid"
+            and outgoing_analysis.get("strength") == "hard"
+        ):
+            continue
+        bypass = analyze_code_transition(
+            before=str(previous.get("_math_text", previous["source_text"])),
+            after=str(following.get("_math_text", following["source_text"])),
+        )
+        if bypass.get("status") == "verified_valid" and bypass.get("strength") == "hard":
+            candidates.append(
+                {
+                    "solution_index": solution_index,
+                    "state_order": order,
+                    "source_text": str(current["source_text"]),
+                    "bypass_from_order": order - 1,
+                    "bypass_to_order": order + 1,
+                    "bypass_status": "verified_valid",
+                    "bypass_strength": "hard",
+                }
+            )
+    return candidates
+
+
+def _hard_invalid_stages(
+    transition_payload: dict[str, Any],
+) -> list[tuple[int, dict[str, Any]]]:
+    return [
+        (stage_index, stage)
+        for stage_index, stage in enumerate(transition_payload.get("stages") or [])
+        if isinstance(stage, dict)
+        and isinstance(stage.get("code_analysis"), dict)
+        and stage["code_analysis"].get("status") == "verified_invalid"
+        and stage["code_analysis"].get("strength") == "hard"
+    ]
+
+
+_HARD_VALID_MATH_ERROR_TYPES = {
+    "calculation_error",
+    "sign_error",
+    "coefficient_error",
+    "incorrect_transformation",
+    "non_equivalent_transformation",
+}
+_HARD_VALID_DENIAL_PHRASES = (
+    "không hợp lệ",
+    "không bảo toàn",
+    "phép biến đổi sai",
+    "sai phép biến đổi",
+    "sai về mặt số học",
+    "sai về mặt đại số",
+    "mathematically invalid",
+    "algebraically invalid",
+    "does not preserve",
+    "not equivalent",
+)
+
+
+def _conflicts_with_hard_valid_math(
+    decision: dict[str, Any],
+    stage: dict[str, Any],
+) -> bool:
+    """Chỉ bắt conflict phủ nhận validity tại đúng transition hard-valid."""
+
+    analysis = stage.get("code_analysis") or {}
+    if not (
+        analysis.get("status") == "verified_valid"
+        and analysis.get("strength") == "hard"
+    ):
+        return False
+    if decision.get("error_type") in _HARD_VALID_MATH_ERROR_TYPES:
+        return True
+    reason = str(decision.get("reason") or "").casefold()
+    return any(phrase in reason for phrase in _HARD_VALID_DENIAL_PHRASES)
+
+
+def _validate_certificate_semantics(
+    decision: dict[str, Any],
+    transition_payload: dict[str, Any],
+    ordered_solution: dict[str, Any],
+) -> str:
+    hard_stages = _hard_invalid_stages(transition_payload)
+    role = decision.get("semantic_role")
+    disposition = decision.get("certificate_disposition")
+    evidence = decision.get("role_evidence")
+    if not hard_stages:
+        if any(value is not None for value in (role, disposition, evidence)):
+            return "mechanical: Không có hard-invalid certificate nên semantic disposition phải là null."
+        return ""
+    if role is None or disposition is None:
+        return "mechanical: Hard-invalid certificate thiếu semantic_role hoặc certificate_disposition."
+
+    ignored_roles = {"hypothetical", "rejected", "self_corrected"}
+    expected_disposition = "ignore" if role in ignored_roles else "accept"
+    if disposition != expected_disposition:
+        return "mechanical: certificate_disposition không nhất quán với semantic_role."
+    if role in ignored_roles and (
+        not isinstance(evidence, str) or not evidence.strip()
+    ):
+        return "mechanical: Certificate chỉ được ignore khi có role_evidence nguyên văn."
+    if isinstance(evidence, str) and evidence.strip() and not any(
+        _normalized_evidence_in_source(evidence, str(state.get("source_text") or ""))
+        for state in ordered_solution.get("states") or []
+        if isinstance(state, dict)
+    ):
+        return "mechanical: role_evidence không grounded trong solution states."
+    return ""
 
 
 def enrich_question_stem_with_visual_descriptions(
@@ -776,7 +1109,7 @@ def build_generated_question_judge_messages(
             "\n\n### SỬA HỢP ĐỒNG ĐẦU RA\n"
             f"Lỗi hợp đồng cụ thể: {contract_retry_error}\n"
             f"### KẾT QUẢ THÔ CẦN SỬA\n{_prompt_json({'raw_candidate': contract_retry_candidate or ''})}\n"
-            "Chỉ sửa lỗi contract của candidate và trả lại đúng 7 field. Không đổi quyết định semantic "
+            "Chỉ sửa lỗi contract của candidate và trả lại đúng 10 field. Không đổi quyết định semantic "
             "hoặc tự đánh giá lại bài toán nếu không cần để sửa anchor/invariant."
         )
     messages = [
@@ -787,7 +1120,7 @@ def build_generated_question_judge_messages(
                 "context bắt buộc đã được code xác nhận đầy đủ trước khi gọi bạn. "
                 "Không đánh giá context availability, mức độ gộp bước hoặc chất lượng trình bày. "
                 "Một transition chỉ có `code_analysis` khi code phát hiện nghi vấn số học hard-invalid; "
-                "đó là tín hiệu advisory và chính bạn phải quyết định đúng/sai. "
+                "certificate này quyết định tính đúng sai toán học; bạn chỉ xác định vai trò ngữ nghĩa của bước trong lời giải. "
                 "Chỉ trả JSON đúng schema, không sửa dữ liệu."
             ),
         },
@@ -796,18 +1129,24 @@ def build_generated_question_judge_messages(
             "content": (
                 f"### TIÊU CHÍ\n{criteria_text}\n\n"
                 "### HỢP ĐỒNG ĐẦU RA\n"
-                "Chỉ trả 7 field semantic theo thứ tự: error_type, solution_index, from_order, to_order, reason, suggestion, status.\n\n"
+                "Chỉ trả 10 field semantic theo thứ tự: error_type, solution_index, from_order, to_order, reason, suggestion, "
+                "semantic_role, certificate_disposition, role_evidence, status.\n\n"
                 f"### NGỮ CẢNH CÂU HỎI\n{_prompt_json(payload)}\n\n"
                 f"### LỜI GIẢI THEO THỨ TỰ\n{_prompt_json(stages)}\n\n"
                 "### RÀNG BUỘC CUỐI\n"
                 "- Chỉ trả lỗi correctness đầu tiên.\n"
-                "- `verified_invalid + hard` là tín hiệu cơ học mạnh cần ưu tiên kiểm tra, nhưng không phải field cần sao chép vào output. "
-                "Nếu đồng ý thì báo lỗi transition theo contract semantic; nếu không đồng ý thì tiếp tục đánh giá bình thường. Các issue_type cơ học gồm "
-                "sign_error, calculation_error, invalid_equivalence hoặc inequality_direction_error.\n"
-                "- Với `verified_invalid + hard`, phải đọc nguyên văn toàn bộ state để xác định biểu thức bị cảnh báo có thực sự "
-                "được dùng làm tiền đề hoặc kết luận hay không. Chỉ được bỏ qua cảnh báo khi lời giải có bằng chứng rõ ràng rằng "
-                "biểu thức đó bị bác bỏ/sửa lại, hoặc chỉ được trích dẫn/đặt làm giả thiết phản ví dụ và không được dùng cho bước sau. "
-                "Nếu không có bằng chứng rõ ràng hoặc biểu thức được dùng tiếp, phải xử lý nó như lỗi correctness.\n"
+                "- `verified_invalid + hard` là certificate toán học đã được code xác minh; không được kết luận phép toán đó thực ra đúng. "
+                "Chỉ phân loại vai trò của certificate sớm nhất bằng semantic_role.\n"
+                "- Transition có `status=verified_valid` và `strength=hard` đã được xác minh deterministic là phép biến đổi toán học hợp lệ. "
+                "Không được kết luận chính transition đó sai phép tính, sai đại số hoặc không bảo toàn tương đương. "
+                "Vẫn phải đánh giá các yêu cầu certificate không chứng minh như điều kiện xác định, thiếu trường hợp, tính đầy đủ hoặc mức độ liên quan.\n"
+                "- asserted_active: bước đang được chấp nhận và dùng tiếp; trả certificate_disposition=accept.\n"
+                "- hypothetical: bước chỉ là giả sử/thử; rejected: bước bị bác bỏ; self_corrected: lời giải tự sửa trước khi kết luận. "
+                "Ba role này chỉ được trả certificate_disposition=ignore khi role_evidence là đoạn nguyên văn trong solution chứng minh cách dùng đó.\n"
+                "- uncertain: không đủ bằng chứng phân loại; trả certificate_disposition=accept để code fail-closed thành needs_review.\n"
+                "- Khi semantic_role=asserted_active, vẫn phải trả status=bad và đầy đủ error_type, anchor, reason, suggestion theo contract; "
+                "không để các field lỗi bằng null.\n"
+                "- Nếu không có `verified_invalid + hard`, trả cả ba field semantic_role, certificate_disposition, role_evidence bằng null.\n"
                 "- Không trả `missing_major_step`; không đánh giá operation count, bước gộp, độ ngắn hoặc mức độ diễn giải. "
                 "Những vấn đề đó thuộc Process & Presentation Judge.\n"
                 "- Ưu tiên nguyên văn `bieu_thuc_sau` và các trạng thái tường minh. Nếu một biểu thức đã xuất hiện trong state, "
@@ -821,6 +1160,7 @@ def build_generated_question_judge_messages(
                 "- Không báo lỗi nháp, tự vấn, lặp lại, wording, ký hiệu `^` hoặc ký tự trình bày; các lỗi này không thuộc Correctness Judge.\n"
                 "- Trước khi chọn trạng thái, bắt buộc tự tính lại từng phép tính và đẳng thức, kiểm tra điều kiện áp dụng của công thức hoặc định lý, "
                 "rồi kiểm tra trạng thái cuối có trả lời đầy đủ yêu cầu ban đầu hay không. Không được kết luận đúng chỉ vì lời giải viết trôi chảy hoặc tự nhất quán.\n"
+                "- Nếu solution khẳng định một đáp án cho đại lượng được hỏi, phải kiểm tra kết luận là chính đại lượng đó, không phải bình phương, lũy thừa, biểu thức trung gian hoặc một đại lượng biến đổi chưa được hoàn nguyên.\n"
                 "- Reason và suggestion viết bằng tiếng Việt.\n"
                 "- reason tối đa 3 câu; suggestion tối đa 2 câu.\n"
                 "- Chỉ ghi status sau khi đã tự kiểm tra xong quyết định semantic; status phải là field cuối.\n"
@@ -842,6 +1182,7 @@ def build_process_presentation_judge_messages(
     ordered_solution: dict[str, Any],
     contract_retry_error: str | None = None,
     contract_retry_candidate: str | None = None,
+    transition_payload: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Prompt chuyên kiểm tra process và chất lượng trình bày."""
 
@@ -863,6 +1204,12 @@ def build_process_presentation_judge_messages(
         str(solution["path"])
         for solution in payload.get("solutions") or []
     ]
+    hard_valid_certificates = _hard_valid_process_certificates(transition_payload)
+    compressed_candidates = _compressed_process_candidates(transition_payload)
+    redundant_candidates = _redundant_state_candidates(
+        ordered_solution,
+        transition_payload,
+    )
     contract_retry_instructions = ""
     if contract_retry_error:
         contract_retry_instructions = (
@@ -885,20 +1232,35 @@ def build_process_presentation_judge_messages(
         {
             "role": "user",
             "content": (
-                f"### RULES\n{criteria_text}\n\n"
-                f"### OUTPUT SCHEMA\n{_prompt_json(ProcessPresentationSemanticOutput.model_json_schema())}\n\n"
-                f"### QUESTION CONTEXT\n{_prompt_json(context)}\n\n"
-                f"### ORDERED SOLUTION STATES\n{_prompt_json(solution_states)}\n\n"
-                f"### SOLUTION PATHS\n{_prompt_json(solution_paths)}\n\n"
-                "### FINAL CONSTRAINTS\n"
+                f"### QUY TẮC\n{criteria_text}\n\n"
+                f"### LƯỢC ĐỒ ĐẦU RA\n{_prompt_json(ProcessPresentationSemanticOutput.model_json_schema())}\n\n"
+                f"### NGỮ CẢNH CÂU HỎI\n{_prompt_json(context)}\n\n"
+                f"### CÁC TRẠNG THÁI LỜI GIẢI THEO THỨ TỰ\n{_prompt_json(solution_states)}\n\n"
+                f"### CHỨNG NHẬN PHÉP BIẾN ĐỔI HỢP LỆ\n{_prompt_json(hard_valid_certificates)}\n\n"
+                f"### ỨNG VIÊN THIẾU BƯỚC\n{_prompt_json(compressed_candidates)}\n\n"
+                f"### ỨNG VIÊN BƯỚC THỪA\n{_prompt_json(redundant_candidates)}\n\n"
+                f"### ĐƯỜNG DẪN LỜI GIẢI\n{_prompt_json(solution_paths)}\n\n"
+                "### RÀNG BUỘC CUỐI\n"
                 "- Chỉ trả 6 field theo thứ tự: error_type, solution_index, state_order, reason, suggestion, verdict.\n"
                 "- Lỗi tại state phải trả đúng solution_index và state_order; code tự dựng source_path và evidence_text.\n"
                 "- Lỗi toàn bộ solution trả solution_index và state_order=null.\n"
-                "- Dùng missing_major_step khi lời giải thiếu biến đổi chính cần thiết cho học sinh theo dõi; "
-                "không dùng nó cho phép tính sai, thiếu nghiệm, thiếu trường hợp hoặc thiếu điều kiện toán học.\n"
+                "- Chỉ dùng missing_major_step khi thiếu một suy luận chính làm state sau không thể kiểm chứng hoặc khôi phục trực tiếp từ các state đã viết, khiến chuỗi reasoning thực sự bị đứt; "
+                "phải nêu chính xác suy luận bị thiếu và vì sao không thể suy ra state sau.\n"
+                "- Viết ngắn nhưng vẫn kiểm chứng trực tiếp được là good. Không báo missing_major_step chỉ vì thiếu công thức tổng quát, câu diễn giải sư phạm, phép tính nhẩm, một bước chuyển vế/rút gọn thông thường hoặc dòng trình bày riêng.\n"
+                "- Không dùng missing_major_step cho phép tính sai, thiếu nghiệm, thiếu trường hợp hoặc thiếu điều kiện toán học.\n"
                 "- Đọc toàn bộ state: nếu trạng thái trung gian đã xuất hiện nguyên văn thì không được báo nó bị thiếu.\n"
+                "- Với mỗi ỨNG VIÊN THIẾU BƯỚC, code đã xác nhận hai đầu tương đương nhưng cần nhiều thao tác và chưa thấy trạng thái trung gian. Đối chiếu toàn bộ lời của state đích với danh sách thao tác: nếu công thức hoặc lời giải chưa thể hiện đủ từng thao tác theo đúng thứ tự thì báo missing_major_step; nếu đã mô tả đủ thì trả good.\n"
+                "- Nêu một phần danh sách thao tác vẫn là thiếu bước. Trạng thái đích và các từ nối như 'suy ra', 'nên', 'do đó' không được tính là mô tả cho thao tác còn thiếu.\n"
+                "- ỨNG VIÊN THIẾU BƯỚC chỉ là bằng chứng về độ nén, không tự động là lỗi; bạn vẫn phải đọc phần trình bày để quyết định.\n"
                 "- Không kiểm tra lại hay sửa kết quả toán học.\n"
-                "- verdict=good: code bỏ qua các field nhận xét còn lại và canonical hóa thành không có issue.\n"
+                "- Certificate verified_valid với strength=hard xác nhận transition tương ứng hợp lệ toán học; không được biến redundant_step thành lỗi toán học.\n"
+                "- Không báo missing_major_step cho chính transition verified_valid với strength=hard chỉ vì lời giải không viết thành lời thao tác cộng, trừ, nhân hoặc chia; biểu thức đích đã xuất hiện là trạng thái trung gian tường minh.\n"
+                "- Nếu transition verified_valid với strength=hard bị nhận định là không cần thiết, không liên quan đến tiến trình hoặc có thể xóa mà lời giải vẫn nối được, bắt buộc dùng error_type=redundant_step và verdict=good; tuyệt đối không dùng missing_major_step.\n"
+                "- Mỗi state trong ỨNG VIÊN BƯỚC THỪA đã có bypass verified_valid với strength=hard. Nếu state chỉ chứa phép biến đổi trung gian và không bổ sung điều kiện hay giải thích cần thiết, trả redundant_step tại đúng state đó.\n"
+                "- Chỉ đánh giá bước có cần thiết, bị lặp, làm reasoning khó theo dõi hay là nội dung nháp/tự sửa hay không.\n"
+                "- Một bước đúng nhưng không cần thiết có thể dùng error_type=redundant_step với verdict=good; đây là advisory nhẹ và không làm toàn bộ lời giải thành bad.\n"
+                "- Chỉ dùng verdict=bad cho redundancy khi lời giải vòng lặp, mâu thuẫn, rất khó theo dõi hoặc có nhiều bước thừa làm hỏng cách trình bày reasoning.\n"
+                "- verdict=good không có advisory: code bỏ qua các field nhận xét còn lại và canonical hóa thành không có issue.\n"
                 "- Reason và suggestion viết bằng tiếng Việt.\n"
                 "- Chỉ trả một JSON object đúng schema; không thêm field, không bỏ field bắt buộc.\n"
                 "- Dùng null thay vì chuỗi \"None\"; enum phải đúng giá trị trong schema; không markdown.\n\n"
@@ -962,12 +1324,12 @@ def build_combined_contract_correction_messages(
         {
             "role": "user",
             "content": (
-                "Sửa đồng thời candidate Correctness và Process & Presentation thành 13 field phẳng có prefix. "
+                "Sửa đồng thời candidate Correctness và Process & Presentation thành 16 field phẳng có prefix. "
                 "Mọi field đều bắt buộc; dùng null đúng kiểu. Chỉ dùng solution_index/state order trong canonical_anchors.\n\n"
-                f"### INPUT CẦN SỬA\n{_prompt_json(correction_input)}\n\n"
-                "### INVARIANT CORRECTNESS\n"
+                f"### DỮ LIỆU CẦN SỬA\n{_prompt_json(correction_input)}\n\n"
+                "### ĐIỀU KIỆN BẤT BIẾN CỦA CORRECTNESS\n"
                 f"{CORRECTNESS_OUTPUT_INVARIANTS}\n\n"
-                "### INVARIANT PROCESS & PRESENTATION\n"
+                "### ĐIỀU KIỆN BẤT BIẾN CỦA PROCESS & PRESENTATION\n"
                 f"{PROCESS_PRESENTATION_OUTPUT_INVARIANTS}\n\n"
                 f"{JSON_SERIALIZATION_CONSTRAINTS}"
             ),
@@ -983,7 +1345,7 @@ def build_transition_stages(
 
     stages: list[dict[str, Any]] = []
     premise = (
-        _problem_anchor(compact_generated_question_payload(generated_question))
+        _transition_premise(ordered_solution, generated_question)
         if generated_question is not None
         else None
     )
@@ -1009,6 +1371,8 @@ def build_transition_stages(
                 "source_path": premise["source_path"],
                 "bieu_thuc_truoc": premise["source_text"],
                 "bieu_thuc_sau": states[0]["source_text"],
+                "_math_before": premise.get("_math_text", premise["source_text"]),
+                "_math_after": states[0].get("_math_text", states[0]["source_text"]),
             })
         for previous, current in zip(states, states[1:]):
             stages.append({
@@ -1019,6 +1383,8 @@ def build_transition_stages(
                 "to_order": int(current["order"]),
                 "bieu_thuc_truoc": previous["source_text"],
                 "bieu_thuc_sau": current["source_text"],
+                "_math_before": previous.get("_math_text", previous["source_text"]),
+                "_math_after": current.get("_math_text", current["source_text"]),
             })
     return {"stages": stages}
 
@@ -1167,6 +1533,45 @@ def validate_correctness_semantic_output(
     """Validate the small LLM decision, then ground it entirely from Builder data."""
 
     error_type_normalized = False
+    stage_payload = transition_payload or build_transition_stages(
+        ordered_solution, generated_question
+    )
+
+    # The model's only new responsibility is semantic disposition. If it accepts
+    # a hard certificate but leaves the ordinary bad envelope incomplete, keep
+    # the grounded disposition and let deterministic enforcement build the issue.
+    if (
+        isinstance(parsed, dict)
+        and _hard_invalid_stages(stage_payload)
+        and parsed.get("semantic_role") in {"asserted_active", "uncertain"}
+        and parsed.get("certificate_disposition") == "accept"
+        and parsed.get("status") in {"bad", "uncertain"}
+    ):
+        bad_envelope_complete = (
+            parsed.get("status") == "bad"
+            and parsed.get("error_type") is not None
+            and isinstance(parsed.get("solution_index"), int)
+            and isinstance(parsed.get("to_order"), int)
+            and bool(str(parsed.get("reason") or "").strip())
+            and bool(str(parsed.get("suggestion") or "").strip())
+        )
+        uncertain_envelope_complete = (
+            parsed.get("status") == "uncertain"
+            and bool(str(parsed.get("reason") or "").strip())
+        )
+        if not bad_envelope_complete and not uncertain_envelope_complete:
+            parsed = {
+                "error_type": None,
+                "solution_index": None,
+                "from_order": None,
+                "to_order": None,
+                "reason": None,
+                "suggestion": None,
+                "semantic_role": parsed.get("semantic_role"),
+                "certificate_disposition": parsed.get("certificate_disposition"),
+                "role_evidence": parsed.get("role_evidence"),
+                "status": "good",
+            }
 
     # `status` is the sole semantic decision for good. Any stale error metadata
     # emitted before the final status is deliberately discarded, not repaired.
@@ -1178,6 +1583,9 @@ def validate_correctness_semantic_output(
             "to_order": None,
             "reason": None,
             "suggestion": None,
+            "semantic_role": parsed.get("semantic_role"),
+            "certificate_disposition": parsed.get("certificate_disposition"),
+            "role_evidence": parsed.get("role_evidence"),
             "status": "good",
         }
 
@@ -1246,6 +1654,19 @@ def validate_correctness_semantic_output(
     except ValidationError as exc:
         return None, "mechanical: " + validation_error_text(exc)
 
+    certificate_error = _validate_certificate_semantics(
+        decision,
+        stage_payload,
+        ordered_solution,
+    )
+    if certificate_error:
+        return None, certificate_error
+    certificate_fields = {
+        "semantic_role": decision["semantic_role"],
+        "certificate_disposition": decision["certificate_disposition"],
+        "role_evidence": decision["role_evidence"],
+    }
+
     status = decision["status"]
     if status == "good":
         canonical = {
@@ -1255,9 +1676,12 @@ def validate_correctness_semantic_output(
             "suggestion": "",
             "verdict": "good",
         }
-        return validate_transition_judge_output(
+        validated, error = validate_transition_judge_output(
             canonical, ordered_solution, generated_question, transition_payload
         )
+        if validated is not None:
+            validated.update(certificate_fields)
+        return validated, error
 
     anchor_values = (
         decision.get("solution_index"),
@@ -1271,13 +1695,11 @@ def validate_correctness_semantic_output(
             "reason": decision["reason"],
             "suggestion": decision.get("suggestion") or "",
             "verdict": "uncertain",
+            **certificate_fields,
         }, ""
     if decision.get("solution_index") is None or decision.get("to_order") is None:
         return None, "mechanical: Correctness anchor chỉ được bỏ hoàn toàn cho status=uncertain."
 
-    stage_payload = transition_payload or build_transition_stages(
-        ordered_solution, generated_question
-    )
     stage = next(
         (
             candidate
@@ -1290,6 +1712,12 @@ def validate_correctness_semantic_output(
     )
     if stage is None:
         return None, "mechanical: Correctness anchor không trỏ tới ordered transition canonical."
+
+    if _conflicts_with_hard_valid_math(decision, stage):
+        return None, (
+            "semantic: Correctness phủ nhận tính hợp lệ toán học của transition "
+            "đã được Code Analyzer xác nhận verified_valid với strength=hard."
+        )
 
     evidence_text = str(stage.get("bieu_thuc_sau") or "").strip()
     if not evidence_text:
@@ -1313,6 +1741,8 @@ def validate_correctness_semantic_output(
     )
     if validated is not None and error_type_normalized:
         validated["error_type_normalized"] = True
+    if validated is not None:
+        validated.update(certificate_fields)
     return validated, error
 
 
@@ -1350,7 +1780,14 @@ def apply_mandatory_arithmetic_result(
         if isinstance(stage, dict)
         and isinstance(stage.get("mandatory_code_issue"), dict)
     ]
-    if not mandatory_stages or correctness_result.get("contract_valid") is not True:
+    hard_stages = _hard_invalid_stages(transition_payload)
+    if (
+        not mandatory_stages
+        or not hard_stages
+        or mandatory_stages[0][0] != hard_stages[0][0]
+        or correctness_result.get("contract_valid") is not True
+        or correctness_result.get("certificate_disposition") != "accept"
+    ):
         return correctness_result, False
     mandatory_index, stage, mandatory_issue = mandatory_stages[0]
     llm_index = _transition_stage_index(correctness_result, transition_payload)
@@ -1371,6 +1808,8 @@ def apply_mandatory_arithmetic_result(
         f"không phải {actual_result}."
     )
     suggestion = f"Sửa kết quả của phép tính thành {expected_result}."
+    role = correctness_result.get("semantic_role")
+    is_uncertain = role == "uncertain"
     canonical = {
         "first_invalid_transition": {
             "solution_index": int(stage["solution_index"]),
@@ -1381,9 +1820,13 @@ def apply_mandatory_arithmetic_result(
             "calculation_check": calculation_check,
         },
         "context_issue": None,
-        "reason": reason,
-        "suggestion": suggestion,
-        "verdict": "bad",
+        "reason": (
+            "Không xác định chắc chắn vai trò ngữ nghĩa của phép tính bị certificate đánh dấu sai."
+            if is_uncertain
+            else reason
+        ),
+        "suggestion": "Cần kiểm tra thủ công bước bị cảnh báo." if is_uncertain else suggestion,
+        "verdict": "uncertain" if is_uncertain else "bad",
     }
     validated, error = validate_transition_judge_output(
         canonical,
@@ -1396,6 +1839,88 @@ def apply_mandatory_arithmetic_result(
     return {
         "contract_valid": True,
         "http_retry_count": int(correctness_result.get("http_retry_count") or 0),
+        "semantic_role": role,
+        "certificate_disposition": correctness_result.get("certificate_disposition"),
+        "role_evidence": correctness_result.get("role_evidence"),
+        **validated,
+    }, True
+
+
+def apply_hard_invalid_equivalence_result(
+    correctness_result: dict[str, Any],
+    transition_payload: dict[str, Any],
+    ordered_solution: dict[str, Any],
+    generated_question: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Enforce the earliest hard math certificate using the LLM semantic role."""
+
+    candidates = _hard_invalid_stages(transition_payload)
+    if not candidates or correctness_result.get("contract_valid") is not True:
+        return correctness_result, False
+    role = correctness_result.get("semantic_role")
+    disposition = correctness_result.get("certificate_disposition")
+    if disposition == "ignore" and role in {
+        "hypothetical",
+        "rejected",
+        "self_corrected",
+    }:
+        return correctness_result, False
+    if disposition != "accept" or role not in {"asserted_active", "uncertain"}:
+        return correctness_result, False
+
+    candidate_index, stage = candidates[0]
+    analysis = stage["code_analysis"]
+    llm_index = _transition_stage_index(correctness_result, transition_payload)
+    if llm_index is not None and llm_index <= candidate_index:
+        return correctness_result, False
+
+    before = str(stage["bieu_thuc_truoc"])
+    after = str(stage["bieu_thuc_sau"])
+    issue_type = str(analysis.get("issue_type") or "")
+    error_type = {
+        "calculation_error": "calculation_error",
+        "sign_error": "sign_error",
+        "invalid_equivalence": "non_equivalent_transformation",
+        "inequality_direction_error": "incorrect_transformation",
+        "division_by_zero": "calculation_error",
+    }.get(issue_type, "incorrect_transformation")
+    is_uncertain = role == "uncertain"
+    canonical = {
+        "first_invalid_transition": {
+            "solution_index": int(stage["solution_index"]),
+            "from_order": stage["from_order"],
+            "to_order": int(stage["to_order"]),
+            "error_type": error_type,
+            "evidence_text": after,
+            "calculation_check": None,
+        },
+        "context_issue": None,
+        "reason": (
+            "Không xác định chắc chắn vai trò ngữ nghĩa của bước bị certificate toán học đánh dấu sai."
+            if is_uncertain
+            else f"Phép biến đổi từ '{before}' sang '{after}' không hợp lệ về mặt toán học."
+        ),
+        "suggestion": (
+            "Cần kiểm tra thủ công bước bị cảnh báo."
+            if is_uncertain
+            else "Sửa bước biến đổi để biểu thức sau hợp lệ so với biểu thức trước."
+        ),
+        "verdict": "uncertain" if is_uncertain else "bad",
+    }
+    validated, _error = validate_transition_judge_output(
+        canonical,
+        ordered_solution,
+        generated_question,
+        transition_payload,
+    )
+    if validated is None:
+        return correctness_result, False
+    return {
+        "contract_valid": True,
+        "http_retry_count": int(correctness_result.get("http_retry_count") or 0),
+        "semantic_role": role,
+        "certificate_disposition": disposition,
+        "role_evidence": correctness_result.get("role_evidence"),
         **validated,
     }, True
 
@@ -1404,13 +1929,48 @@ def validate_process_presentation_judge_output(
     parsed: Any,
     ordered_solution: dict[str, Any],
     generated_question: dict[str, Any],
+    transition_payload: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     try:
         semantic = ProcessPresentationSemanticOutput.model_validate(parsed).model_dump()
     except ValidationError as exc:
         return None, validation_error_text(exc)
 
-    if semantic["verdict"] == "good":
+    redundant_candidate = next(
+        (
+            candidate
+            for candidate in _redundant_state_candidates(
+                ordered_solution,
+                transition_payload,
+            )
+            if semantic["solution_index"] is not None
+            and semantic["state_order"] is not None
+            and int(candidate["solution_index"]) == int(semantic["solution_index"])
+            and int(candidate["state_order"]) == int(semantic["state_order"])
+        ),
+        None,
+    )
+    if (
+        redundant_candidate is not None
+        and semantic["verdict"] == "bad"
+        and semantic["error_type"] == "missing_major_step"
+    ):
+        semantic = {
+            **semantic,
+            "error_type": "redundant_step",
+            "reason": (
+                f"Bước {redundant_candidate['source_text'].strip()} đúng toán học nhưng thừa; "
+                "bỏ bước này vẫn nối được hai trạng thái trước và sau bằng một transition verified_valid + hard."
+            ),
+            "suggestion": "Bỏ bước trung gian thừa và giữ đường biến đổi trực tiếp.",
+            "verdict": "good",
+        }
+
+    redundant_advisory = (
+        semantic["verdict"] == "good"
+        and semantic["error_type"] == "redundant_step"
+    )
+    if semantic["verdict"] == "good" and not redundant_advisory:
         return {
             "issue": None,
             "reason": "",
@@ -1424,7 +1984,7 @@ def validate_process_presentation_judge_output(
         or not semantic["reason"].strip()
         or not semantic["suggestion"].strip()
     ):
-        return None, "Process & Presentation bad/uncertain phải có reason và suggestion."
+        return None, "Process & Presentation bad/uncertain hoặc advisory phải có reason và suggestion."
 
     solution_index = int(semantic["solution_index"])
     state_order = semantic["state_order"]
@@ -1496,6 +2056,9 @@ def validate_combined_contract_correction_output(
         "to_order": output["correctness_to_order"],
         "reason": output["correctness_reason"],
         "suggestion": output["correctness_suggestion"],
+        "semantic_role": output["correctness_semantic_role"],
+        "certificate_disposition": output["correctness_certificate_disposition"],
+        "role_evidence": output["correctness_role_evidence"],
         "status": output["correctness_status"],
     }
     process_semantic = {
@@ -1518,6 +2081,7 @@ def validate_combined_contract_correction_output(
         process_semantic,
         ordered_solution,
         generated_question,
+        transition_payload,
     )
     if process_result is None:
         return None, f"Process correction invalid: {process_error}"
@@ -1715,6 +2279,7 @@ def _call_process_presentation_judge(
     client: LLMClient,
     model: str,
     debug: bool,
+    transition_payload: dict[str, Any] | None = None,
     contract_retry_error: str | None = None,
     contract_retry_candidate: str | None = None,
 ) -> dict[str, Any]:
@@ -1731,11 +2296,13 @@ def _call_process_presentation_judge(
             ordered_solution,
             contract_retry_error,
             contract_retry_candidate,
+            transition_payload,
         ),
         validator=lambda parsed: validate_process_presentation_judge_output(
             parsed,
             ordered_solution,
             generated_question,
+            transition_payload,
         ),
         invalid_json_message="Gemma Process & Presentation không trả JSON hợp lệ.",
         response_format=process_presentation_response_format(ordered_solution),
@@ -1783,7 +2350,7 @@ def _call_combined_contract_correction(
 @dataclass(frozen=True)
 class AnchoredSolutionIssue:
     source: Literal["correctness", "process_presentation"]
-    verdict: Literal["bad", "uncertain"]
+    verdict: Literal["bad", "uncertain", "warning"]
     scope: Literal["state", "global"]
     solution_index: int | None
     source_path: str
@@ -1856,14 +2423,18 @@ def normalize_process_presentation_result(
     result: dict[str, Any],
     ordered_solution: dict[str, Any],
 ) -> AnchoredSolutionIssue | None:
-    if result["verdict"] == "good":
+    if result["verdict"] == "good" and not (
+        isinstance(result.get("issue"), dict)
+        and result["issue"].get("error_type") == "redundant_step"
+    ):
         return None
 
     issue = result["issue"]
+    normalized_verdict = "warning" if result["verdict"] == "good" else result["verdict"]
     if issue["scope"] == "global":
         return AnchoredSolutionIssue(
             source="process_presentation",
-            verdict=result["verdict"],
+            verdict=normalized_verdict,
             scope="global",
             solution_index=int(issue["solution_index"]),
             source_path=issue["source_path"],
@@ -1886,7 +2457,7 @@ def normalize_process_presentation_result(
     )
     return AnchoredSolutionIssue(
         source="process_presentation",
-        verdict=result["verdict"],
+        verdict=normalized_verdict,
         scope="state",
         solution_index=int(issue["solution_index"]),
         source_path=issue["source_path"],
@@ -2011,17 +2582,19 @@ def aggregate_specialized_judge_results(
             generated_question=generated_question,
             index=index,
         )
-    selected = _select_earliest_solution_issue(normalized_issues)
+    blocking_issues = [issue for issue in normalized_issues if issue.verdict != "warning"]
+    selected = _select_earliest_solution_issue(blocking_issues or normalized_issues)
     if selected is not None:
+        advisory = selected.verdict == "warning"
         payload = {
             "is_good": False,
             "issues": [{
-                "severity": "needs_review",
+                "severity": "warning" if advisory else "needs_review",
                 "category": "solution_quality",
                 "location": selected.source_path,
                 "reason": selected.reason,
                 "suggestion": selected.suggestion,
-                "repair_intent": "needs_manual_review",
+                "repair_intent": "clean_solution_reasoning" if advisory else "needs_manual_review",
             }],
         }
     else:
@@ -2157,6 +2730,7 @@ def judge_generated_question_object(
             client=client,
             model=model,
             debug=debug,
+            transition_payload=transition_payload,
             contract_retry_error=contract_retry_error,
             contract_retry_candidate=contract_retry_candidate,
         )
@@ -2345,14 +2919,19 @@ def judge_generated_question_object(
     )
     final_correctness_result = correctness_result
     if correctness_valid:
-        final_correctness_result, _ = (
-            apply_mandatory_arithmetic_result(
-                correctness_result,
+        final_correctness_result, arithmetic_applied = apply_mandatory_arithmetic_result(
+            correctness_result,
+            transition_payload,
+            ordered_solution,
+            generated_question,
+        )
+        if not arithmetic_applied:
+            final_correctness_result, _ = apply_hard_invalid_equivalence_result(
+                final_correctness_result,
                 transition_payload,
                 ordered_solution,
                 generated_question,
             )
-        )
 
     if not (
         isinstance(final_correctness_result, dict)
