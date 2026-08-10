@@ -334,6 +334,8 @@ def _context_text_sources(payload: dict[str, Any]) -> dict[str, str]:
 def validate_splitter_output(
     parsed: Any,
     generated_question: dict[str, Any],
+    *,
+    require_visual_descriptions: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     try:
         split = SolutionSplitOutput.model_validate(parsed).model_dump()
@@ -365,7 +367,7 @@ def validate_splitter_output(
         if key in described_visuals:
             return None, "visual_descriptions chứa ảnh trùng lặp."
         described_visuals.add(key)
-    if described_visuals != expected_visuals:
+    if require_visual_descriptions and described_visuals != expected_visuals:
         return None, (
             "Splitter phải mô tả đúng một lần mọi image_url được đính kèm "
             "trong question context."
@@ -459,6 +461,7 @@ def split_solution_with_code(
     generated_question: dict[str, Any],
     *,
     max_tokens: int = CODE_SPLITTER_MAX_TOKENS,
+    allow_direct_visual_fallback: bool = False,
 ) -> tuple[dict[str, Any] | None, str]:
     """Fallback deterministic: cắt text gốc theo cửa sổ token, không sửa nội dung."""
 
@@ -483,10 +486,25 @@ def split_solution_with_code(
     if stem is None:
         return None, "Code splitter không tìm thấy instruction hoặc question stem."
     stem["source_text"] = _context_text_sources(payload)[stem["source_path"]]
-    return validate_splitter_output(
-        {"context_requirements": [], "stem": stem, "states": states},
+    split, error = validate_splitter_output(
+        {
+            "context_requirements": [],
+            "visual_descriptions": [],
+            "stem": stem,
+            "states": states,
+        },
         generated_question,
+        require_visual_descriptions=not allow_direct_visual_fallback,
     )
+    if split is not None and allow_direct_visual_fallback:
+        question_context = {
+            "id": payload.get("id"),
+            "instruction": payload.get("instruction") or [],
+            "questionItems": payload.get("questionItems") or [],
+        }
+        if extract_asset_references(question_context):
+            split["_correctness_reads_images_directly"] = True
+    return split, error
 
 
 def extract_textual_visual_descriptions(
@@ -1112,6 +1130,15 @@ def build_generated_question_judge_messages(
             "Chỉ sửa lỗi contract của candidate và trả lại đúng 10 field. Không đổi quyết định semantic "
             "hoặc tự đánh giá lại bài toán nếu không cần để sửa anchor/invariant."
         )
+    direct_visual_fallback = bool(
+        ordered_solution.get("_correctness_reads_images_directly")
+    )
+    direct_visual_instruction = (
+        "- Splitter không tạo được mô tả ảnh hợp lệ nên ảnh gốc được đính kèm trực tiếp ở cuối prompt này. "
+        "Phải tự đọc ảnh để kiểm tra correctness; không kết luận thiếu ngữ cảnh chỉ vì đề chứa URL.\n"
+        if direct_visual_fallback
+        else ""
+    )
     messages = [
         {
             "role": "system",
@@ -1155,6 +1182,7 @@ def build_generated_question_judge_messages(
                 "không tự đánh giá wording hoặc độ chi tiết sư phạm.\n"
                 "- Các đoạn `[Mô tả dữ liệu trực quan do Splitter đọc từ ảnh]` trong stem/instruction là bản chép nội bộ "
                 "từ ảnh đã được Splitter đọc. Phải dùng phần text này như dữ liệu đề bài; không tải lại URL và không tự báo thiếu ảnh.\n"
+                f"{direct_visual_instruction}"
                 "- Khi trả anchor, phải sao chép đúng solution_index/from_order/to_order của một stage đã cung cấp; "
                 "không tự tạo cặp order, không bỏ qua state ở giữa và chỉ dùng from_order=null cho chính initial_transition.\n"
                 "- Không báo lỗi nháp, tự vấn, lặp lại, wording, ký hiệu `^` hoặc ký tự trình bày; các lỗi này không thuộc Correctness Judge.\n"
@@ -1173,6 +1201,8 @@ def build_generated_question_judge_messages(
             ),
         },
     ]
+    if direct_visual_fallback:
+        return attach_remote_visual_assets(messages, payload)
     return messages
 
 
@@ -2637,7 +2667,10 @@ def judge_generated_question_object(
     code_splitter_used = False
     if split is None:
         split_error = gemma_split_error
-        split, code_split_error = split_solution_with_code(generated_question)
+        split, code_split_error = split_solution_with_code(
+            generated_question,
+            allow_direct_visual_fallback=True,
+        )
         if split is not None:
             code_splitter_used = True
         else:

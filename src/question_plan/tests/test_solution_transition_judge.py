@@ -1043,6 +1043,38 @@ def test_splitter_visual_description_enriches_correctness_without_resending_imag
     assert "Đồ thị đi qua O và tăng trên khoảng đang xét." not in presentation_content
 
 
+def test_code_splitter_fallback_sends_original_image_to_correctness():
+    generated = question()
+    generated["instruction"][0]["text"] = (
+        "Dựa vào đồ thị: ![Đồ thị hàm số](https://example.test/graph.webp)"
+    )
+
+    ordered, error = split_solution_with_code(
+        generated,
+        allow_direct_visual_fallback=True,
+    )
+
+    assert error == ""
+    assert ordered is not None
+    assert ordered["visual_descriptions"] == []
+    assert ordered["_correctness_reads_images_directly"] is True
+
+    analyzed = analyze_transition_stages(build_transition_stages(ordered, generated))
+    correctness_content = build_generated_question_judge_messages(
+        generated,
+        "Correctness rules.",
+        ordered,
+        analyzed,
+    )[-1]["content"]
+
+    assert isinstance(correctness_content, list)
+    assert "Splitter không tạo được mô tả ảnh hợp lệ" in correctness_content[0]["text"]
+    assert correctness_content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://example.test/graph.webp"},
+    }
+
+
 def test_structured_image_description_becomes_internal_stem_block_without_mutation():
     generated = question()
     generated["questionItems"][0]["stem"] = [{
