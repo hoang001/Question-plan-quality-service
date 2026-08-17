@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -14,7 +13,7 @@ from ..infra.config import (
     AppConfig,
     generated_question_resolver_model,
 )
-from ..infra.debug import debug_llm_messages
+from ..infra.debug import debug_llm_messages, trace_pipeline_event
 from ..infra.llm_client import LLMClient
 from ..shared.real_schema import content_to_text
 from ..shared.utils import parse_json_output
@@ -43,8 +42,6 @@ from .generated_question_schema import (
 )
 
 
-KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
-RESOLVER_RULES_PATH = KNOWLEDGE_DIR / "solution_anchor_resolver_rules.md"
 VALID_RESOLVER_STATUSES = {"resolved", "needs_manual_review"}
 VALID_CATEGORIES = {"solution_anchor_consistency", "solution_quality", "hint_quality"}
 VALID_INTENTS = {
@@ -54,25 +51,6 @@ VALID_INTENTS = {
     "needs_manual_review",
 }
 OPTION_INTERACTION_TYPES = {"single_choice", "multiple_choice", "choice_blank_fill", "matching"}
-RESOLVER_OUTPUT_INVARIANTS = """ĐIỀU KIỆN BẤT BIẾN CỦA ĐẦU RA:
-- `final_answer` bắt buộc phải là một JSON object; không được là string, array hoặc null.
-- `final_answer` phải có bốn field semantic: `text`, `matched_option_id`, `correctOptionIds`, `expected`; không được bỏ bất kỳ field semantic nào.
-- `final_answer.text` bắt buộc phải tồn tại và phải là JSON string.
-- `matched_option_id` là JSON string hoặc null; `correctOptionIds` luôn là JSON array.
-- `evidence_from_solution` là metadata tùy chọn. Nếu có, code sẽ thử grounding và tự khôi phục đoạn nguyên văn; field này không quyết định resolver contract.
-- Khi `resolver_status="resolved"`, `final_answer.text` phải là chuỗi không rỗng.
-- Khi `resolver_status="needs_manual_review"`, `final_answer.text` phải là chuỗi rỗng `""`.
-- `answer_spec_alignment` phải là `matched`, `equivalent` hoặc `mismatched`.
-- `matched`/`equivalent` chỉ dùng khi `answerSpec_matches_solution=true`; `mismatched` chỉ dùng khi `answerSpec_matches_solution=false`.
-- Dùng `equivalent` khi answerSpec khác cách biểu diễn nhưng tương đương semantic với kết luận solution.
-- Không được bỏ field `final_answer` hoặc `final_answer.text`.
-- Không dùng chuỗi `"None"`, `"null"` hoặc `"N/A"`.
-- Chỉ trả một JSON object đúng schema; không viết markdown, code fence hoặc nội dung bên ngoài JSON."""
-
-
-def load_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
 
 def deep_content_text(value: Any) -> str:
     """Flatten content blocks structurally without interpreting their meaning."""
@@ -210,9 +188,67 @@ def compact_generated_question_for_solution_anchor(generated_question: dict[str,
     }
 
 
+RESOLVER_OUTPUT_INVARIANTS = """ĐIỀU KIỆN BẤT BIẾN CỦA ĐẦU RA:
+- `final_answer` bắt buộc phải là một JSON object; không được là string, array hoặc null.
+- `final_answer` phải có bốn field semantic: `text`, `matched_option_id`, `correctOptionIds`, `expected`; không được bỏ bất kỳ field semantic nào.
+- `final_answer.text` bắt buộc phải tồn tại và phải là JSON string.
+- `matched_option_id` là JSON string hoặc null; `correctOptionIds` luôn là JSON array.
+- `evidence_from_solution` là metadata tùy chọn. Nếu có, code sẽ thử grounding và tự khôi phục đoạn nguyên văn; field này không quyết định resolver contract.
+- Khi `resolver_status="resolved"`, `final_answer.text` phải là chuỗi không rỗng.
+- Khi `resolver_status="needs_manual_review"`, `final_answer.text` phải là chuỗi rỗng `""`.
+- `answer_spec_alignment` phải là `matched`, `equivalent` hoặc `mismatched`.
+- `matched`/`equivalent` chỉ dùng khi `answerSpec_matches_solution=true`; `mismatched` chỉ dùng khi `answerSpec_matches_solution=false`.
+- Dùng `equivalent` khi answerSpec khác cách biểu diễn nhưng tương đương semantic với kết luận solution.
+- Không được bỏ field `final_answer` hoặc `final_answer.text`.
+- Không dùng chuỗi `"None"`, `"null"` hoặc `"N/A"`.
+- Chỉ trả một JSON object đúng schema; không viết markdown, code fence hoặc nội dung bên ngoài JSON."""
+SOLUTION_ANCHOR_RESOLVER_RULES = """# Quy tắc Solution Resolver
+
+## Mốc canonical
+
+- Không kiểm tra solution đúng hay sai về toán học/chuyên môn.
+- Không tự giải lại bài từ instruction/stem.
+- Chỉ dùng một kết luận explicit làm canonical khi solution khẳng định rõ đó là đáp án cuối cho đúng đại lượng/interaction được hỏi và cardinality phù hợp interaction type.
+- Kết luận explicit không bắt buộc có từ “Vậy”; một câu như “cạnh còn lại bằng 25” vẫn là kết luận explicit vì gắn trực tiếp giá trị với đại lượng được hỏi.
+- Không lấy số xuất hiện cuối, số trung gian, giá trị thử, hệ số hoặc kết quả phụ làm canonical chỉ vì nó đứng cuối solution.
+- Nếu không xác định chắc kết luận đang trả lời đúng đại lượng/interaction, trả `needs_manual_review`; không ép đối chiếu answerSpec.
+- Không dùng answerSpec để phủ định hoặc sửa solution.
+- Nếu solution không có kết luận cụ thể, không đoán và trả `needs_manual_review`.
+
+## Interaction type
+
+- `single_choice`: hợp lệ khi có đúng một đáp án cuối. Nhiều số/phương trình/option trung gian không phải nhiều đáp án cuối. Chỉ manual khi kết luận thật sự nói nhiều đáp án như “A hoặc C”, “m=0 hoặc m=1”, “chọn A và B”.
+- `multiple_choice`: nhiều đáp án cuối có thể hợp lệ; đối chiếu tập kết luận với `correctOptionIds`.
+- `short_answer`, `fill_blank`, `coordinate_input`, `true_false`: dùng kết luận cụ thể làm canonical expected; manual nếu thiếu hoặc có các kết luận cuối mâu thuẫn.
+- `essay`: Correctness và Process/Presentation đã kiểm tra nội dung cùng rubric/yêu cầu tự luận. Resolver bỏ qua interaction này, không ép thành option/đáp án ngắn và không tạo căn chỉnh answerSpec.
+
+## Map và đối chiếu
+
+- Nếu solution kết luận bằng label, option id hoặc giá trị/nội dung, tự hiểu semantic và map sang option tương ứng.
+- Không dùng regex/code rule; không phụ thuộc một mẫu câu tiếng Việt cố định.
+- Trả `answer_spec_alignment="matched"` khi answerSpec khớp trực tiếp với kết luận solution.
+- Trả `answer_spec_alignment="equivalent"` khi cách biểu diễn khác nhưng tương đương semantic; trường hợp này vẫn đặt `answerSpec_matches_solution=true` và không tạo field fix.
+- Trả `answer_spec_alignment="mismatched"` khi answerSpec thực sự lệch kết luận solution; trường hợp này đặt `answerSpec_matches_solution=false` và tạo field fix/issue căn chỉnh theo các invariant hiện có.
+- Chỉ enforce mismatch sau khi đã xác định chắc explicit final conclusion theo phần Mốc canonical; không dùng quy tắc “số cuối solution khác answerSpec”.
+- Nếu answerSpec lệch canonical, tạo đúng một `solution_anchor_consistency`, intent `align_fields_to_solution`, kèm `fields_to_fix` đến expected hiện có.
+- Nếu answerSpec đã khớp, không tạo issue answer mismatch và không tạo field fix.
+
+## Hint alignment
+
+- Chỉ kiểm tra hint khi solution đã resolved.
+- Hint chỉ cần dẫn tới cách giải/canonical solution; không cần phù hợp distractor hoặc answerSpec đang sai.
+- Nếu answerSpec sai nhưng hint đúng theo solution, chỉ sửa answerSpec.
+- Nếu hint mâu thuẫn trực tiếp với solution, tạo `hint_quality` tại hint path, intent `align_hint_to_solution`.
+- Nếu solution cần manual review, không emit hint alignment và không sửa hint.
+
+## Solution presentation
+
+- Generic Quality Judge sở hữu lỗi dài dòng, thử-sai, tự vấn hoặc đoạn nháp khi final answer vẫn rõ; resolver không emit trùng.
+- Resolver chỉ dùng `solution_quality/needs_manual_review` khi thiếu kết luận hoặc cardinality kết luận không hợp lệ/mâu thuẫn thật sự.
+- Khi manual review, không align answerSpec/options/hints và không tự tạo đáp án mới."""
+
 def build_solution_anchor_resolver_messages(
     generated_question: dict[str, Any],
-    rules_text: str,
 ) -> list[dict[str, str]]:
     payload = compact_generated_question_for_solution_anchor(generated_question)
     output_schema_text = contract_schema_text(SolutionResolverOutput)
@@ -237,7 +273,7 @@ def build_solution_anchor_resolver_messages(
                 "phép có nhiều đáp án. Nếu không có kết luận cụ thể, không đoán và không đề xuất sửa answerSpec/options/hints. "
                 "Generic Quality Judge sẽ xử lý dài dòng/thử-sai/tự vấn khi final answer vẫn rõ, nên resolver không emit "
                 "trùng lỗi trình bày đó. Mọi reason/suggestion phải là tiếng Việt có dấu.\n\n"
-                f"QUY TẮC RESOLVER:\n{rules_text}\n\n"
+                f"QUY TẮC RESOLVER:\n{SOLUTION_ANCHOR_RESOLVER_RULES}\n\n"
                 f"LƯỢC ĐỒ ĐẦU RA:\n{output_schema_text}\n\n"
                 f"DỮ LIỆU ĐỘNG:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
                 f"{RESOLVER_OUTPUT_INVARIANTS}\n"
@@ -418,6 +454,40 @@ def _dedupe_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _nearest_existing_issue_location(
+    generated_question: dict[str, Any],
+    raw_location: str,
+    *,
+    fallback_locations: list[str] | None = None,
+) -> str:
+    """Anchor advisory issue metadata without weakening field-fix validation."""
+
+    candidates = [location_to_json_pointer(raw_location)]
+    candidates.extend(
+        location_to_json_pointer(location)
+        for location in (fallback_locations or [])
+    )
+    candidates.extend(("/solutions/0", "/solutions"))
+    canonical = [candidate for candidate in candidates if candidate.startswith("/")]
+    for pointer in canonical:
+        try:
+            get_by_json_pointer(generated_question, pointer)
+            return pointer
+        except JsonPointerError:
+            pass
+    seen: set[str] = set(canonical)
+    for candidate in canonical:
+        pointer = candidate.rsplit("/", 1)[0]
+        while pointer and pointer not in seen:
+            seen.add(pointer)
+            try:
+                get_by_json_pointer(generated_question, pointer)
+                return pointer
+            except JsonPointerError:
+                pointer = pointer.rsplit("/", 1)[0]
+    return "/solutions"
+
+
 def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, Any]) -> dict[str, Any]:
     try:
         parsed = SolutionResolverOutput.model_validate(parsed).model_dump()
@@ -471,14 +541,17 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
     ):
         return resolver_contract_error("final_answer.correctOptionIds chứa option không tồn tại")
 
+    fallback_locations = [
+        str(value.get("path") or "")
+        for value in parsed["fields_to_fix"]
+        if isinstance(value, dict)
+    ]
     for value in parsed["issues"]:
-        raw_location = str(value["location"])
-        if location_to_json_pointer(raw_location) != raw_location:
-            return resolver_contract_error("issue.location không phải JSON Pointer chuẩn")
-        try:
-            get_by_json_pointer(generated_question, raw_location)
-        except JsonPointerError:
-            return resolver_contract_error("issue.location không tồn tại trong generated question")
+        value["location"] = _nearest_existing_issue_location(
+            generated_question,
+            str(value.get("location") or ""),
+            fallback_locations=fallback_locations,
+        )
     issues = [issue for issue in (_normalize_issue(value) for value in parsed["issues"]) if issue]
     if status == "needs_manual_review":
         if final_answer["text"]:
@@ -548,8 +621,22 @@ def normalize_solution_anchor_result(parsed: Any, generated_question: dict[str, 
             "answerSpec_matches_solution=true nhưng vẫn có issue căn chỉnh answerSpec"
         )
     if not answer_spec_matches and not align_issues:
-        return resolver_contract_error(
-            "answerSpec_matches_solution=false nhưng thiếu issue căn chỉnh answerSpec"
+        first_fix = fixes[0]
+        issues.append(
+            _issue(
+                severity="bad",
+                category="solution_anchor_consistency",
+                location=str(first_fix["path"]),
+                reason=(
+                    str(first_fix.get("reason") or "").strip()
+                    or "answerSpec không khớp với kết luận cuối của solution."
+                ),
+                suggestion=(
+                    str(first_fix.get("suggestion") or "").strip()
+                    or "Cập nhật answerSpec theo kết luận cuối đã được Resolver xác định."
+                ),
+                repair_intent="align_fields_to_solution",
+            )
         )
     if any(issue.get("category") == "solution_quality" for issue in issues):
         return resolver_contract_error(
@@ -586,13 +673,38 @@ def _call_solution_resolver(
     debug: bool,
 ) -> dict[str, Any]:
     try:
+        trace_pipeline_event(
+            stage="resolver",
+            event="input",
+            payload={"model": model, "messages": messages},
+            object_id=generated_question.get("id") or generated_question.get("_id"),
+        )
         debug_llm_messages(step="solution_anchor_resolver", model=model, messages=messages, debug=debug)
         response = client.chat_completion(model=model, messages=messages, temperature=0)
+        trace_pipeline_event(
+            stage="resolver",
+            event="output",
+            payload=response,
+            object_id=generated_question.get("id") or generated_question.get("_id"),
+        )
         parsed, ok, parse_error = parse_json_output(str(response.get("content") or ""))
         if not ok:
             return resolver_contract_error(parse_error or "Không parse được output của Solution Resolver.")
-        return normalize_solution_anchor_result(parsed, generated_question)
+        result = normalize_solution_anchor_result(parsed, generated_question)
+        trace_pipeline_event(
+            stage="resolver",
+            event="canonical_output",
+            payload=result,
+            object_id=generated_question.get("id") or generated_question.get("_id"),
+        )
+        return result
     except Exception as exc:
+        trace_pipeline_event(
+            stage="resolver",
+            event="error",
+            payload={"type": type(exc).__name__, "message": str(exc)},
+            object_id=generated_question.get("id") or generated_question.get("_id"),
+        )
         return resolver_runtime_error(str(exc))
 
 
@@ -608,10 +720,7 @@ def resolve_solution_anchor_consistency(
     if config is None or client is None:
         return manual_review_result("Không có LLM client/config để chạy Solution Resolver.")
 
-    messages = build_solution_anchor_resolver_messages(
-        generated_question,
-        load_text(RESOLVER_RULES_PATH),
-    )
+    messages = build_solution_anchor_resolver_messages(generated_question)
     resolver_model = generated_question_resolver_model(config)
     result = _call_solution_resolver(
         generated_question=generated_question,

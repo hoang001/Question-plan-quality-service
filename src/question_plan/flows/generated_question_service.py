@@ -14,10 +14,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from ..infra.config import AppConfig, generated_question_gemma_concurrency, load_config
-from ..infra.debug import llm_prompt_debug_enabled
+from ..infra.config import (
+    AppConfig,
+    generated_question_correctness_model,
+    generated_question_gemma_concurrency,
+    generated_question_presentation_model,
+    load_config,
+)
+from ..infra.debug import llm_prompt_debug_enabled, trace_pipeline_event
 from ..infra.llm_client import LLMClient
 from ..logic.generated_question_judge import (
+    build_no_prompt_messages,
     judge_generated_question_object,
 )
 from ..logic.generated_question_repair import normalize_scoped_repair_result, repair_generated_question_scoped
@@ -40,9 +47,53 @@ from ..logic.solution_anchor_resolver import compact_generated_question_for_solu
 SERVICE_ROOT_DIR = Path(__file__).resolve().parents[3]
 GeneratedQuestionProgressCallback = Callable[[int, int, dict[str, Any]], None]
 MAX_GENERATED_QUESTION_WORKERS = 2
+
+
+def evaluate_generated_questions_raw(
+    payload: dict[str, Any] | list[dict[str, Any]],
+    *,
+    config: AppConfig,
+    client: LLMClient,
+    progress_callback: GeneratedQuestionProgressCallback | None = None,
+) -> dict[str, Any] | list[dict[str, Any]]:
+    """Call both solution models without schema, parsing, gates, or post-processing."""
+
+    generated_questions = normalize_generated_question_input(payload)
+
+    def evaluate_one(index: int, generated_question: dict[str, Any]) -> dict[str, Any]:
+        if progress_callback:
+            progress_callback(index + 1, len(generated_questions), generated_question)
+        messages = build_no_prompt_messages(generated_question)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            correctness_future = executor.submit(
+                client.chat_completion,
+                model=generated_question_correctness_model(config),
+                messages=messages,
+                temperature=0,
+            )
+            process_future = executor.submit(
+                client.chat_completion,
+                model=generated_question_presentation_model(config),
+                messages=messages,
+                temperature=0,
+            )
+            correctness_response = correctness_future.result()
+            process_response = process_future.result()
+        return {
+            "id": generated_question.get("id") or generated_question.get("_id") or f"item[{index}]",
+            "correctness_output": str(correctness_response.get("content") or ""),
+            "process_output": str(process_response.get("content") or ""),
+        }
+
+    results = [
+        evaluate_one(index, generated_question)
+        for index, generated_question in enumerate(generated_questions)
+    ]
+    return results if isinstance(payload, list) or len(results) != 1 else results[0]
 JUDGE_ROUTING_FIELDS = (
+    "correctness_comments",
+    "process_comments",
     "judge_model",
-    "splitter_model",
     "correctness_primary_model",
     "process_presentation_model",
     "final_correctness_model",
@@ -184,6 +235,8 @@ def public_generated_question_result(result: dict[str, Any], *, debug: bool) -> 
             "id": result.get("id"),
             "is_good": bool(result.get("is_good")),
             "issues": [compact_issue(issue) for issue in issues],
+            "correctness_comments": list(result.get("correctness_comments") or []),
+            "process_comments": list(result.get("process_comments") or []),
             "new_generated_question": repaired,
         }
 
@@ -211,6 +264,8 @@ def public_generated_question_result(result: dict[str, Any], *, debug: bool) -> 
         "id": result.get("id"),
         "is_good": bool(result.get("is_good")),
         "issues": [compact_issue(issue) for issue in issues],
+        "correctness_comments": list(result.get("correctness_comments") or []),
+        "process_comments": list(result.get("process_comments") or []),
         "new_generated_question": repaired,
     }
     if runtime_details:
@@ -644,6 +699,15 @@ def evaluate_generated_question_object(
 ) -> dict[str, Any]:
     try:
         schema_result = validate_generated_question_object(generated_question, index)
+        trace_pipeline_event(
+            stage="structural_validator",
+            event="output",
+            payload={
+                "generated_question": generated_question,
+                "validation_result": schema_result,
+            },
+            object_id=generated_question.get("id") or generated_question.get("_id"),
+        )
         schema_issues = schema_result.get("issues") or []
         if has_bad_issue(schema_issues):
             checked = merge_generated_question_results(
@@ -675,10 +739,22 @@ def evaluate_generated_question_object(
             if isinstance(judge_result, dict):
                 for key in JUDGE_ROUTING_FIELDS:
                     checked[key] = judge_result.get(key)
-            if (
-                resolver_gate_open(judge_result, checked)
-                and compact_generated_question_for_solution_anchor(generated_question)["interaction_contexts"]
-            ):
+            interaction_contexts = compact_generated_question_for_solution_anchor(
+                generated_question
+            )["interaction_contexts"]
+            gate_open = resolver_gate_open(judge_result, checked)
+            trace_pipeline_event(
+                stage="quality_gate",
+                event="output",
+                payload={
+                    "gate_open": gate_open,
+                    "has_interaction_context": bool(interaction_contexts),
+                    "judge_result": judge_result,
+                    "checked_result": checked,
+                },
+                object_id=generated_question.get("id") or generated_question.get("_id"),
+            )
+            if gate_open and interaction_contexts:
                 anchor = resolve_solution_anchor_consistency(
                     generated_question,
                     config=config,
@@ -692,7 +768,20 @@ def evaluate_generated_question_object(
                     generated_question=generated_question,
                     index=index,
                 )
-        return maybe_repair_generated_question(
+            else:
+                trace_pipeline_event(
+                    stage="resolver",
+                    event="skipped",
+                    payload={
+                        "reason": (
+                            "quality_gate_closed"
+                            if not gate_open
+                            else "missing_interaction_context"
+                        )
+                    },
+                    object_id=generated_question.get("id") or generated_question.get("_id"),
+                )
+        final_result = maybe_repair_generated_question(
             generated_question,
             with_internal_defaults(checked),
             strict_mode=strict_mode,
@@ -703,6 +792,13 @@ def evaluate_generated_question_object(
             auto_repair=auto_repair,
             max_loop=max_loop,
         )
+        trace_pipeline_event(
+            stage="public_result",
+            event="internal_output_before_public_compaction",
+            payload=final_result,
+            object_id=generated_question.get("id") or generated_question.get("_id"),
+        )
+        return final_result
     except Exception as exc:
         return with_internal_defaults(fail_closed_output(str(exc), generated_question=generated_question, index=index))
 

@@ -23,9 +23,25 @@ def parse_json_output(content: str) -> tuple[dict[str, Any] | None, bool, str | 
     if start >= 0 and end > start:
         candidates.append(text[start : end + 1])
 
+    expanded_candidates = []
     for candidate in candidates:
+        # Local models occasionally emit mechanically invalid JSON despite a
+        # response schema: raw line breaks, trailing commas, or LaTeX commands
+        # with a single backslash. Repair syntax only; never alter field values.
+        repaired = re.sub(
+            r'(?<!\\)\\(?=(?:frac|sqrt|text|times|cdot|pi|Rightarrow|left|right)\b)',
+            r"\\\\",
+            candidate,
+        )
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", repaired)
+        if repaired != candidate:
+            expanded_candidates.append(repaired)
+        expanded_candidates.append(candidate)
+
+    for candidate in expanded_candidates:
         try:
-            parsed = json.loads(candidate)
+            parsed = json.loads(candidate, strict=False)
         except ValueError:
             continue
         if isinstance(parsed, dict):

@@ -19,15 +19,9 @@ from .generated_question_schema import location_to_json_pointer, make_issue
 
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
-SPELLING_RULES_PATH = KNOWLEDGE_DIR / "generated_question_spelling_rules.md"
 SPELLING_WHITELIST_PATH = KNOWLEDGE_DIR / "spelling_whitelist_vi.txt"
 MATH_PATTERN = re.compile(r"(\$\$.*?\$\$|\$.*?\$|```.*?```)", re.DOTALL)
 VIETNAMESE_ACCENT_CHARS = set("àáảãạăằắẳẵặâầấẩẫậđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ")
-
-
-def load_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
 
 def load_whitelist() -> set[str]:
     if not SPELLING_WHITELIST_PATH.exists():
@@ -273,9 +267,49 @@ def dictionary_domain_issues(node: dict[str, Any], whitelist: set[str]) -> list[
     return []
 
 
+GENERATED_QUESTION_SPELLING_RULES = """# Generated Question Spelling/Wording Rules
+
+LLM spelling judge chỉ kiểm tra lỗi chính tả và diễn đạt trong text node của generated question.
+
+## Scope
+
+- Chỉ dùng các text node được cung cấp.
+- Không dùng question_plan, raw question, raw answer, source answer, source PDF/OCR.
+- Không sửa đáp án, logic toán, answerSpecs hoặc interaction config.
+- Không sửa id, JSON key, code, JSON Pointer.
+- Không sửa nội dung bên trong math placeholder hoặc LaTeX segment.
+
+## What To Check
+
+- Lỗi chính tả tiếng Việt rõ ràng.
+- Lỗi gõ, lặp từ, lặp dấu câu bất thường.
+- Khoảng trắng sai trước/sau dấu câu.
+- Câu quá khó hiểu do diễn đạt.
+- Mojibake/encoding lỗi rõ ràng.
+
+## What Not To Flag
+
+- Thuật ngữ toán học đúng.
+- Biến toán như x, y, m, n.
+- LaTeX command hoặc biểu thức toán.
+- Tên interaction type, id, enum.
+- Cách viết hơi khác nhưng vẫn rõ nghĩa.
+
+## Correction Policy
+
+- `corrected_text` chỉ sửa chính tả/diễn đạt.
+- Không đổi nghĩa chuyên môn.
+- Không đổi đáp án.
+- Không đổi math segment/LaTeX.
+- Nếu không chắc, chỉ báo `needs_review` và để `corrected_text=null`.
+
+## Language
+
+- Toàn bộ `reason`, `suggestion`, `corrected_text` nếu có phải viết bằng tiếng Việt có dấu.
+- Không dùng câu tiếng Anh, trừ tên field, id, enum, JSON Pointer, code hoặc LaTeX."""
+
 def build_generated_question_spelling_messages(
     text_nodes: list[dict[str, Any]],
-    rules_text: str,
 ) -> list[dict[str, str]]:
     payload_nodes = []
     for node in text_nodes:
@@ -313,7 +347,7 @@ def build_generated_question_spelling_messages(
                 "- Không trả markdown hoặc giải thích ngoài JSON.\n"
                 f"- {language_policy}\n\n"
                 "SPELLING RULES:\n"
-                f"{rules_text}\n\n"
+                f"{GENERATED_QUESTION_SPELLING_RULES}\n\n"
                 "OUTPUT SCHEMA:\n"
                 f"{output_schema_text}\n\n"
                 "TEXT NODES:\n"
@@ -395,8 +429,7 @@ def check_spelling_and_wording(
     candidate_nodes = [node for node in nodes if any(issue.get("location") == node.get("path") for issue in rule_issues)]
     if not candidate_nodes:
         candidate_nodes = nodes[:20]
-    rules_text = load_text(SPELLING_RULES_PATH)
-    messages = build_generated_question_spelling_messages(candidate_nodes, rules_text)
+    messages = build_generated_question_spelling_messages(candidate_nodes)
     model = generated_question_fast_model(config)
     start = time.perf_counter()
     try:
