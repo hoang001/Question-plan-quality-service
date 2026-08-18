@@ -529,8 +529,8 @@ PROCESS_PRESENTATION_CRITERIA = """1. Đọc toàn bộ solution theo thứ tự
 
     Nếu biểu thức trung gian đã xuất hiện ở bất kỳ vị trí nào trong nội dung đang kiểm tra thì tuyệt đối không được báo biểu thức đó bị thiếu.
 
-    Không yêu cầu viết riêng các phép tính số học phụ như:
-    `200 - 40 = 160`, `160 : 5 = 32`,
+    Không yêu cầu viết riêng cụ thể các phép tính số học phụ như:
+    `5x^5 = 200 - 40, 5x^5 = 160`, hay `x^5 = 160 : 5, x^5 = 32`,
     nếu kết quả của chúng đã được thể hiện trong bước biến đổi chính.
 
     Ví dụ: Giải phương trình 5x^5 + 40 = 200. Ta có: 5x^5 = 160, x^5 = 32, x = 2
@@ -690,7 +690,15 @@ COMMENTS_REVIEW_CRITERIA = """1. Chỉ kiểm chứng từng comment được cu
 
    Nếu comment Correctness nêu thiếu hình, bảng, đồ thị hoặc dữ liệu trực quan, đối chiếu instruction, stem, dữ liệu chữ và danh sách ảnh đính kèm. Dùng `blocking` khi đề thực sự phụ thuộc dữ liệu đó nhưng không có ảnh, liên kết, mô tả hoặc dữ liệu chữ đủ thay thế; việc không thể kiểm chứng vì thiếu nguồn chính là căn cứ chấp nhận comment, không phải lý do bác bỏ. Dùng `rejected` khi dữ liệu cần thiết đã được cung cấp hoặc đề không phụ thuộc nó. Không tưởng tượng nội dung còn thiếu.
 
-4. Với comment từ Process, kiểm chứng đúng loại lỗi đã nêu. Riêng `missing_major_step`, dùng `blocking` khi giữa hai nội dung liền kề thực sự thiếu ít nhất hai phép biến đổi chính hoặc một ý tưởng bắt buộc; dùng `rejected` nếu định vị sai, cầu nối đã xuất hiện qua các phương thức khác như lập luận,... hay nội dung sau thực chất sai toán học. Khi chấp nhận, viết lại ngắn gọn đúng nội dung trước, nội dung sau và cầu nối bị thiếu. Với `redundant_step`, dùng `advisory`. Chỉ kiểm chứng nội dung nháp hoặc thử-sai khi comment Process nêu đúng loại đó.
+4. Với comment từ Process, kiểm chứng đúng loại lỗi đã nêu. Riêng `missing_major_step`, dùng `blocking` khi giữa hai nội dung liền kề thực sự thiếu ít nhất hai phép biến đổi chính hoặc một ý tưởng bắt buộc. 
+    - Tuy nhiên, không yêu cầu viết riêng cụ thể các phép tính số học như: 
+    `5x^5 = 200 - 40, 5x^5 = 160`, hay `x^5 = 160 : 5, x^5 = 32`. 
+    Ví dụ sau là lời giải tốt: Giải phương trình 5x^5 + 40 = 200. Ta có: 5x^5 = 160, x^5 = 32, x = 2
+    Chuỗi tường minh là:
+    I. 5x^5 = 160
+    II. x^5 = 32
+    III. x = 2
+    - Dùng `rejected` nếu định vị sai, cầu nối đã xuất hiện qua các phương thức khác như lập luận,... hay nội dung sau thực chất sai toán học. Khi chấp nhận, viết lại ngắn gọn đúng nội dung trước, nội dung sau và cầu nối bị thiếu. Với `redundant_step`, dùng `advisory`. Chỉ kiểm chứng nội dung nháp hoặc thử-sai khi comment Process nêu đúng loại đó.
 
 5. `review_reason` là kết luận cuối, không phải bản ghi quá trình cân nhắc. Mọi khẳng định phải khớp evidence, không tự mâu thuẫn và không thêm lỗi mới. Nếu comment chứa nhiều cáo buộc, chỉ trình bày lỗi chắc chắn sớm nhất. Với `blocking` hoặc `advisory`, viết một `review_suggestion` trực tiếp sửa đúng lỗi đó; với `rejected`, trả `review_suggestion=""`. Giữ nguyên giá trị đúng từ candidate; viết phép nhân bằng ký tự `×`, không dùng dấu chấm, chữ `x` hoặc lệnh LaTeX. Số thập phân dùng dấu phẩy. Nếu ký hiệu nguồn còn nhiều cách hiểu, chỉ nêu phần sai chắc chắn chung cho mọi cách hiểu, không tự chọn hoặc liệt kê nhiều đáp án. Không nhắc tên các thành phần pipeline. `review_reason` tối đa hai câu và 400 ký tự; `review_suggestion` tối đa một câu và 300 ký tự.
 
