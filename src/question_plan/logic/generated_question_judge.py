@@ -690,8 +690,8 @@ COMMENTS_REVIEW_CRITERIA = """1. Chỉ kiểm chứng từng comment được cu
 
    Nếu comment Correctness nêu thiếu hình, bảng, đồ thị hoặc dữ liệu trực quan, đối chiếu instruction, stem, dữ liệu chữ và danh sách ảnh đính kèm. Dùng `blocking` khi đề thực sự phụ thuộc dữ liệu đó nhưng không có ảnh, liên kết, mô tả hoặc dữ liệu chữ đủ thay thế; việc không thể kiểm chứng vì thiếu nguồn chính là căn cứ chấp nhận comment, không phải lý do bác bỏ. Dùng `rejected` khi dữ liệu cần thiết đã được cung cấp hoặc đề không phụ thuộc nó. Không tưởng tượng nội dung còn thiếu.
 
-4. Với comment từ Process, kiểm chứng đúng loại lỗi đã nêu. Riêng `missing_major_step`, dùng `blocking` khi giữa hai nội dung liền kề thực sự thiếu ít nhất hai phép biến đổi chính hoặc một ý tưởng bắt buộc. 
-    - Tuy nhiên, không yêu cầu viết riêng cụ thể các phép tính số học như: 
+4. Với comment từ Process, kiểm chứng đúng loại lỗi đã nêu. Riêng `missing_major_step`, dùng `blocking` khi giữa hai nội dung liền kề thực sự chứa ít nhất nhất hai phép biến đổi chính (cộng, trừ, nhân, chia, khai căn, số mũ, liên hợp,...) với cùng một toán tử hoặc một ý tưởng bắt buộc. 
+    - Tuy nhiên, không yêu cầu viết riêng cụ thể các phép tính số học đơn giản như sau: 
     `5x^5 = 200 - 40, 5x^5 = 160`, hay `x^5 = 160 : 5, x^5 = 32`. 
     Ví dụ sau là lời giải tốt: Giải phương trình 5x^5 + 40 = 200. Ta có: 5x^5 = 160, x^5 = 32, x = 2
     Chuỗi tường minh là:
