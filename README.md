@@ -21,7 +21,6 @@ LLM_CHAT_COMPLETIONS_ENDPOINT=
 
 PRIMARY_JUDGE_MODEL=gemma-4-12b-it
 FALLBACK_JUDGE_MODEL=gemma-4-26b
-SOLUTION_SPLITTER_MODEL=gemma-4-12b-it
 SOLUTION_CORRECTNESS_MODEL=gemma-4-26b
 PROCESS_PRESENTATION_MODEL=gemma-4-12b-it
 SOLUTION_RESOLVER_MODEL=gemma-4-26b
@@ -128,6 +127,19 @@ Nếu muốn xem diagnostics nội bộ:
 python cli.py --evaluate-generated-questions-service --input data/processed/math_9_bt_test.json --debug
 ```
 
+Để chạy check-only và lưu toàn bộ input/output của từng stage (Structural Validator,
+Correctness, Process, contract correction nếu có,
+Aggregate, Quality Gate và Resolver) vào một file JSONL dễ đối chiếu, dùng một dòng
+PowerShell sau. `--workers 1` giữ log của các object theo đúng thứ tự; luồng repair
+không chạy và không tạo file repaired:
+
+```powershell
+python cli.py --evaluate-generated-questions-service --input tests/judge_problem_solution_test_cases.json --output results/judge_problem_results.json --report-output results/judge_problem_report.md --trace-output results/judge_problem_pipeline_trace.jsonl --workers 1 --no-auto-repair
+```
+
+Mỗi dòng trong file trace là một JSON object đầy đủ, có `object_id`, `stage`, `event`
+và `payload`. Terminal vẫn chỉ hiển thị tiến độ và đường dẫn output thông thường.
+
 Nếu muốn truyền output path riêng:
 
 ```powershell
@@ -182,11 +194,12 @@ Trong Swagger, endpoint generated question có các query params public: `strict
 
 Các policy đã được internal hóa:
 
-- Flow generated question chạy theo thứ tự structural validator → Splitter → hai Judge chuyên biệt chạy song song → aggregate → solution quality gate → Solution Resolver → normalize/repair.
-- Gemma 12B Splitter tạo ordered states và context requirements. Nếu output Splitter không canonical, code splitter là fallback cuối để tách text; nếu vẫn thất bại thì fail closed.
-- Ảnh HTTP(S) chỉ được gửi cho Splitter. Splitter trả mô tả grounded, code chèn mô tả vào bản sao stem nội bộ, còn Correctness/Process/Resolver không nhận lại ảnh.
-- Code Transition Analyzer chỉ gắn metadata và cảnh báo `verified_invalid + hard`; analyzer không tự quyết định public verdict.
-- Gemma 26B Correctness chỉ chấm đúng/sai toán học. Gemma 12B Process & Presentation chỉ chấm độ đầy đủ và chất lượng trình bày.
+- Flow generated question chạy theo thứ tự structural validator → Correctness và Process chạy song song trên nguyên văn solution → aggregate → solution quality gate → Solution Resolver → normalize/repair.
+- Correctness và Process nhận trực tiếp đề bài cùng toàn bộ solution; không chia state và không dựng transition.
+- Transition Builder chỉ ghép đề bài và các trạng thái lời giải liền kề; không chấm đúng sai bằng code.
+- Gemma 26B Correctness trả checklist theo đúng chuỗi `Đề → A`, `A → B`, ...; mỗi phần tử chỉ gồm `transition_id`, `is_valid`, `reason`. Code kiểm tra đủ ID, đúng thứ tự và tự dựng verdict từ transition sai đầu tiên; LLM không trả error type, anchor tổng hợp hoặc suggestion. Gemma 12B Process & Presentation nhận cùng chuỗi transition (bao gồm `Đề → A`) để chấm độ đầy đủ và chất lượng trình bày nhưng không phán đúng/sai toán học.
+- Chuỗi dài được code chia thành các lô liên tiếp: tối đa 20 transition cho Correctness và 24 transition cho Process & Presentation. Correctness dừng sau lô chứa lỗi đầu tiên; Process dừng sau lô chứa issue `bad/uncertain`. Mỗi lô sau giữ nguyên `transition_id` và không lặp lại `initial_transition`.
+- Với interaction `essay`, hai Judge nhận thêm config và rubric/yêu cầu tự luận: Correctness kiểm tra nội dung bắt buộc, Process kiểm tra mạch lập luận và trình bày; Resolver không ép essay thành đáp án ngắn.
 - Hai Judge dùng chung tối đa một contract-correction call cho mỗi object. Handoff còn non-canonical hoặc runtime sau correction sẽ fail closed trước Resolver.
 - Nếu solution cần làm sạch hoặc review, flow xử lý solution trước và chưa căn chỉnh `answerSpecs`/options/hints; Resolver chỉ chạy khi solution vượt qua quality gate.
 - Solution Resolver là nguồn semantic duy nhất khi đối chiếu `solutions` với `answerSpecs/options/hints`.
@@ -233,3 +246,14 @@ python cli.py --list-models
 python cli.py --ping
 python cli.py --ping 
 ```
+
+Chạy chế độ không chèn prompt tiêu chí để so sánh:
+
+```powershell
+python cli.py --evaluate-generated-questions-service --input tests/test.json --output results/test_no_prompt.json --no-prompt
+```
+
+Trong chế độ này, message gửi Correctness và Process chỉ gồm đề, lời giải và câu `Kiểm tra lời giải của bài trên`. Service không truyền schema, không parse, không aggregate và không chạy Resolver; chuỗi model trả về được ghi nguyên vào `correctness_output` và `process_output`.
+
+chạy đầy đủ:
+ "python cli.py --evaluate-generated-questions-service --input tests/test.json --output results/test_results.json --report-output results/test_report.md --repaired-output results/test_repaired.json --debug"

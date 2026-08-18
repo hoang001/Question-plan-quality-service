@@ -1,10 +1,14 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
-from src.question_plan.flows.generated_question_service import evaluate_generated_questions
+from src.question_plan.flows.generated_question_service import (
+    evaluate_generated_questions,
+    evaluate_generated_questions_raw,
+)
 from src.question_plan.flows.service import evaluate_question_plan, evaluate_question_plans
 from src.question_plan.infra.config import ConfigError, load_config
 from src.question_plan.infra.llm_client import LLMClient
@@ -61,6 +65,27 @@ def write_json_output(path: Path, payload: Any) -> None:
 
 def markdown_text(value: Any) -> str:
     return str(value or "").strip().replace("|", "\\|").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
+def judge_comments_markdown(comments: Any, *, include_error_type: bool = False) -> str:
+    rendered: list[str] = []
+    for comment in comments or []:
+        if not isinstance(comment, dict):
+            continue
+        parts: list[str] = []
+        if comment.get("review_disposition"):
+            parts.append(f"[{comment['review_disposition']}]")
+        if include_error_type and comment.get("error_type"):
+            parts.append(f"[{comment['error_type']}]")
+        evidence = str(comment.get("evidence") or "").strip()
+        reason = str(comment.get("reason") or "").strip()
+        if evidence:
+            parts.append(f'“{evidence}”')
+        if reason:
+            parts.append(reason)
+        if parts:
+            rendered.append(" — ".join(parts))
+    return "<br>".join(markdown_text(item) for item in rendered)
 
 
 def generated_result_status(result: dict[str, Any]) -> str:
@@ -121,15 +146,15 @@ def generated_report_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_generated_question_markdown(result: dict[str, Any], *, source_name: str = "") -> str:
-    lines: list[str] = ["# Generated Question Quality Report", ""]
+    lines: list[str] = ["# Báo cáo chất lượng câu hỏi sinh", ""]
     if source_name:
-        lines.extend([f"Source file: `{source_name}`", ""])
+        lines.extend([f"Tệp nguồn: `{source_name}`", ""])
     summary = generated_report_summary(result)
     lines.extend(
         [
             "## Tổng quan",
             "",
-            "| Tổng object | Good | Có vấn đề | Bad | Needs review | Warning | Repaired | Manual review | Repair failed | Skipped |",
+            "| Tổng đối tượng | Tốt | Có vấn đề | Lỗi | Cần xem lại | Cảnh báo | Đã sửa | Xem lại thủ công | Sửa thất bại | Bỏ qua |",
             "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             (
                 f"| {summary['total']} | {summary['good']} | {summary['with_issues']} | {summary['bad']} | "
@@ -143,8 +168,8 @@ def format_generated_question_markdown(result: dict[str, Any], *, source_name: s
     )
     lines.extend(
         [
-            "| # | ID | Status | Repair | Issues | Failed Reason | Suggestions |",
-            "|---:|---|---|---|---|---|---|",
+            "| # | ID | Trạng thái | Sửa chữa | Nhận xét Correctness | Nhận xét Process | Vấn đề | Lý do không đạt | Đề xuất |",
+            "|---:|---|---|---|---|---|---|---|---|",
         ]
     )
     for index, item in enumerate(generated_result_list(result), start=1):
@@ -158,11 +183,15 @@ def format_generated_question_markdown(result: dict[str, Any], *, source_name: s
             dict.fromkeys(str(issue.get("suggestion") or "").strip() for issue in issues if issue.get("suggestion"))
         )[:2]
         lines.append(
-            "| {index} | {id} | {status} | {repair} | {issues} | {reasons} | {suggestions} |".format(
+            "| {index} | {id} | {status} | {repair} | {correctness_comments} | {process_comments} | {issues} | {reasons} | {suggestions} |".format(
                 index=index,
                 id=markdown_text(item.get("id") or f"item[{index - 1}]"),
                 status=generated_result_status(item),
                 repair=generated_repair_status(item),
+                correctness_comments=judge_comments_markdown(item.get("correctness_comments")),
+                process_comments=judge_comments_markdown(
+                    item.get("process_comments"), include_error_type=True
+                ),
                 issues=markdown_text(issue_text),
                 reasons=markdown_text("; ".join(reasons)),
                 suggestions=markdown_text("; ".join(suggestions)),
@@ -217,6 +246,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=2, help="Số generated question xử lý song song; Gemma tối đa 4 call.")
     parser.add_argument("--strict-mode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Gọi raw Correctness/Process: không schema, parse, aggregate hoặc Resolver.",
+    )
+    parser.add_argument(
+        "--trace-pipeline",
+        action="store_true",
+        help="In đầy đủ input/output từng stage của generated-question pipeline dưới dạng JSONL.",
+    )
+    parser.add_argument(
+        "--trace-output",
+        default=None,
+        help="Ghi pipeline trace JSONL thuần vào file này; tự bật --trace-pipeline.",
+    )
     parser.add_argument("--auto-repair", action=argparse.BooleanOptionalAction, default=False)
     return parser
 
@@ -229,8 +273,7 @@ def ping_model(client: LLMClient, model: str) -> None:
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Xin chào, hãy mô tả nội dung của ảnh này bằng tiếng Việt."},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": "Xin chào, hãy kiểm tra lời giải của bài toán sau: Giải phương trình 2x^3 + 3 = 19. Ta có 2x^3 = 18, x^3 = 9, suy ra x = 2."}
                 ],
             }
         ],
@@ -271,6 +314,15 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.trace_pipeline or args.trace_output:
+            os.environ["TRACE_GENERATED_QUESTION_PIPELINE"] = "1"
+        if args.trace_output:
+            trace_path = Path(args.trace_output)
+            if not trace_path.is_absolute():
+                trace_path = ROOT_DIR / trace_path
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            trace_path.write_text("", encoding="utf-8")
+            os.environ["TRACE_GENERATED_QUESTION_PIPELINE_OUTPUT"] = str(trace_path)
         if args.inspect_generated_question_schema:
             run_generated_question_schema_inspection(args)
             return 0
@@ -307,6 +359,21 @@ def main() -> int:
         if args.evaluate_generated_questions_service:
             if not isinstance(payload, (dict, list)):
                 raise ValueError("Generated checker nhận object, list hoặc wrapper generatedQuestions.")
+            if args.no_prompt:
+                result = evaluate_generated_questions_raw(
+                    payload,
+                    config=config,
+                    client=client,
+                    progress_callback=print_generated_question_progress,
+                )
+                if args.output:
+                    output_path = Path(args.output)
+                    output_path = output_path if output_path.is_absolute() else ROOT_DIR / output_path
+                    write_json_output(output_path, result)
+                    print(f"Đã ghi raw LLM output: {output_path}")
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0
             result = evaluate_generated_questions(
                 payload,
                 config=config,
@@ -323,10 +390,15 @@ def main() -> int:
                 args.report_output
                 or default_generated_question_report_path(input_path)
             )
-            repaired_path = Path(args.repaired_output or "results/generated_question_repaired_objects.json")
+            repaired_path = (
+                Path(args.repaired_output or "results/generated_question_repaired_objects.json")
+                if args.auto_repair or args.repaired_output
+                else None
+            )
             output_path = output_path if output_path.is_absolute() else ROOT_DIR / output_path
             report_path = report_path if report_path.is_absolute() else ROOT_DIR / report_path
-            repaired_path = repaired_path if repaired_path.is_absolute() else ROOT_DIR / repaired_path
+            if repaired_path is not None:
+                repaired_path = repaired_path if repaired_path.is_absolute() else ROOT_DIR / repaired_path
             for path in write_generated_question_cli_outputs(
                 result=result,
                 source_name=str(input_path),

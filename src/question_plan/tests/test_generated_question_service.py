@@ -1,4 +1,5 @@
 import json
+import re
 from copy import deepcopy
 from pathlib import Path
 from threading import Barrier, Lock
@@ -17,6 +18,8 @@ from src.question_plan.flows.generated_question_service import (
 )
 from src.question_plan.infra.llm_client import ApiError, LLMClient
 from src.question_plan.logic.generated_question_judge import (
+    build_direct_correctness_messages,
+    build_direct_process_presentation_messages,
     compact_generated_question_payload,
     judge_generated_question_object,
 )
@@ -138,12 +141,12 @@ class SequenceClient:
 
 
 class RoleClient:
-    def __init__(self, *, splitters=(), correctness=(), global_quality=(), resolvers=()):
+    def __init__(self, *, correctness=(), global_quality=(), resolvers=(), reviews=()):
         self.payloads = {
-            "splitter": list(splitters),
             "correctness": list(correctness),
             "global_quality": list(global_quality),
             "resolver": list(resolvers),
+            "review": list(reviews),
         }
         self.calls: list[dict] = []
         self.lock = Lock()
@@ -151,106 +154,75 @@ class RoleClient:
     def chat_completion(self, **kwargs):
         system = kwargs["messages"][0]["content"]
         role = (
-            "splitter" if "Solution State Splitter" in system
-            else "correctness" if "Correctness Judge" in system
-            else "global_quality" if "Process & Presentation Judge" in system
+            "review" if "trách nhiệm kiểm chứng các nhận xét" in system
+            else "correctness" if "trách nhiệm kiểm tra tính đúng đắn" in system
+            else "global_quality" if "trách nhiệm xem xét quá trình" in system
             else "resolver" if "Solution Resolver" in system
             else ""
         )
         with self.lock:
             self.calls.append(kwargs)
-            if not role or not self.payloads[role]:
+            if role == "review" and not self.payloads[role]:
+                prompt = kwargs["messages"][-1]["content"]
+                ids = list(dict.fromkeys(re.findall(r'comment_id[^A-Za-z0-9_-]+([A-Za-z0-9_-]+)', prompt)))
+                payload = {
+                    "reviewed_comments": [
+                        {
+                            "comment_id": comment_id,
+                            "disposition": "blocking",
+                            "review_reason": "Nhận xét được xác nhận trong test.",
+                            "review_suggestion": "Sửa nội dung theo nhận xét đã xác nhận.",
+                        }
+                        for comment_id in ids
+                        if comment_id.startswith(("correctness-", "process-"))
+                    ],
+                }
+            elif not role or not self.payloads[role]:
                 raise AssertionError(f"Unexpected LLM call: {role or system[:80]}")
-            payload = self.payloads[role].pop(0)
+            else:
+                payload = self.payloads[role].pop(0)
         if isinstance(payload, Exception):
             raise payload
         return {"content": json.dumps(payload, ensure_ascii=False), "latency_seconds": 0}
 
 
-def splitter_ok() -> dict:
-    return {
-        "context_requirements": [],
-        "stem": {
-            "source_path": "/instruction/0/text",
-            "source_text": "Giải phương trình 2x + 3 = 7.",
-        },
-        "states": [
-            {
-                "solution_index": 0,
-                "order": 0,
-                "source_path": "/solutions/0/solutionContent/0/text",
-                "source_text": "Ta có 2x = 4 ⇒ ",
-            },
-            {
-                "solution_index": 0,
-                "order": 1,
-                "source_path": "/solutions/0/solutionContent/0/text",
-                "source_text": "x = 2.",
-            },
-        ]
-    }
-
-
-def splitter_missing_context() -> dict:
-    output = splitter_ok()
-    output["context_requirements"] = [{
-        "requirement_type": "graph",
-        "description": "Đồ thị bắt buộc để kiểm chứng lời giải.",
-        "availability": "missing",
-        "evidence_text": "Giải phương trình 2x + 3 = 7.",
-    }]
-    return output
-
-
 def judge_ok() -> dict:
     return {
-        "status": "good",
-        "error_type": None,
-        "solution_index": None,
-        "from_order": None,
-        "to_order": None,
-        "reason": None,
-        "suggestion": None,
-        "semantic_role": None,
-        "certificate_disposition": None,
-        "role_evidence": None,
+        "opening_checks": [{
+            "solution_index": 0,
+            "evidence": "Ta có 2x = 4",
+            "analysis": "Khẳng định mở đầu phù hợp với đề bài.",
+        }],
+        "comments": [],
     }
 
 
 def judge_issue(reason: str = "Lời giải làm mất một nghiệm cần được giữ lại.") -> dict:
     return {
-        "status": "bad",
-        "solution_index": 0,
-        "from_order": 0,
-        "to_order": 1,
-        "error_type": "lost_solution",
-        "reason": reason,
-        "suggestion": "Kiểm tra lại bước làm mất nghiệm.",
-        "semantic_role": None,
-        "certificate_disposition": None,
-        "role_evidence": None,
+        "opening_checks": [{
+            "solution_index": 0,
+            "evidence": "Ta có 2x = 4",
+            "analysis": "Khẳng định mở đầu phù hợp với đề bài.",
+        }],
+        "comments": [{"solution_index": 0, "evidence": "Ta có 2x = 4", "reason": reason}],
     }
 
 
 def global_quality_good() -> dict:
     return {
-        "error_type": None,
-        "solution_index": None,
-        "state_order": None,
-        "reason": "",
-        "suggestion": "",
-        "verdict": "good",
+        "comments": [],
     }
 
 
 def global_quality_bad() -> dict:
     return {
-        "error_type": "draft_or_self_questioning",
-        "solution_index": 0,
-        "state_order": 0,
-        "reason": "Lời giải còn đoạn nháp và câu tự vấn.",
-        "suggestion": "Loại bỏ đoạn nháp và chỉ giữ lập luận hoàn chỉnh.",
-        "verdict": "bad",
+        "comments": [{
+            "error_type": "draft_or_self_questioning",
+            "solution_index": 0,
+            "evidence": "Ta có 2x = 4",
+            "reason": "Lời giải còn đoạn nháp và câu tự vấn.",
+            "suggestion": "Loại bỏ đoạn nháp và chỉ giữ lập luận hoàn chỉnh.",
+        }],
     }
 
 
@@ -493,7 +465,6 @@ def test_input_accepts_single_list_and_wrapper():
 
 def test_single_object_runs_judge_then_resolver_and_returns_compact_output():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok()],
         global_quality=[global_quality_good()],
         resolvers=[resolver_ok()],
@@ -501,14 +472,20 @@ def test_single_object_runs_judge_then_resolver_and_returns_compact_output():
 
     result = evaluate_generated_questions(generated_question("direct"), config=fake_config(), client=client)
 
-    assert result == {"id": "direct", "is_good": True, "issues": [], "new_generated_question": None}
-    assert len(client.calls) == 4
+    assert result == {
+        "id": "direct",
+        "is_good": True,
+        "issues": [],
+        "correctness_comments": [],
+        "process_comments": [],
+        "new_generated_question": None,
+    }
+    assert len(client.calls) == 3
     assert all(call["model"] == "fast-model" for call in client.calls)
 
 
 def test_resolver_matched_does_not_trigger_correctness_fallback():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok()],
         global_quality=[global_quality_good()],
         resolvers=[resolver_ok()],
@@ -526,7 +503,6 @@ def test_resolver_matched_does_not_trigger_correctness_fallback():
 
 def test_resolver_mismatch_keeps_solution_based_fix_without_correctness_recheck():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok(), judge_ok()],
         global_quality=[global_quality_good()],
         resolvers=[resolver_mismatch()],
@@ -555,17 +531,19 @@ def test_resolver_mismatch_keeps_solution_based_fix_without_correctness_recheck(
     primary_correctness_call = next(
         call for call in client.calls
         if call["model"] == "fast-model"
-        and "Correctness Judge" in call["messages"][0]["content"]
+        and "trách nhiệm kiểm tra tính đúng đắn" in call["messages"][0]["content"]
     )
     assert primary_correctness_call["response_format"]["type"] == "json_schema"
     primary_schema = primary_correctness_call["response_format"]["json_schema"]["schema"]
     assert "oneOf" not in primary_schema
-    assert list(primary_schema["properties"])[-1] == "status"
+    assert list(primary_schema["properties"]) == [
+        "opening_checks",
+        "comments",
+    ]
 
 
 def test_resolver_mismatch_keeps_fix_and_does_not_consume_second_correctness_candidate():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok(), judge_issue("Fallback phát hiện solution sai.")],
         global_quality=[global_quality_good()],
         resolvers=[resolver_mismatch()],
@@ -586,7 +564,6 @@ def test_resolver_mismatch_keeps_fix_and_does_not_consume_second_correctness_can
 
 def test_resolver_mismatch_does_not_consume_noncanonical_second_candidate():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok(), {"verdict": "good"}],
         global_quality=[global_quality_good()],
         resolvers=[resolver_mismatch()],
@@ -607,7 +584,6 @@ def test_resolver_mismatch_does_not_consume_noncanonical_second_candidate():
 
 def test_correctness_runtime_stops_before_resolver_without_semantic_fallback():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[RuntimeError("primary timeout"), judge_ok()],
         global_quality=[global_quality_good()],
         resolvers=[resolver_mismatch()],
@@ -625,14 +601,43 @@ def test_correctness_runtime_stops_before_resolver_without_semantic_fallback():
     assert result["correctness_fallback_called"] is False
     correctness_calls = [
         call for call in client.calls
-        if "Correctness Judge" in call["messages"][0]["content"]
+        if "trách nhiệm kiểm tra tính đúng đắn" in call["messages"][0]["content"]
     ]
     assert len(correctness_calls) == 1
 
 
+def test_process_runtime_enables_retry_and_does_not_report_unrun_review():
+    client = RoleClient(
+        correctness=[judge_ok()],
+        global_quality=[RuntimeError("process timeout")],
+        resolvers=[resolver_ok()],
+    )
+
+    result = evaluate_generated_question_object(
+        generated_question("process-runtime"),
+        config=fake_config(),
+        client=client,
+    )
+
+    process_calls = [
+        call for call in client.calls
+        if "trách nhiệm xem xét quá trình"
+        in call["messages"][0]["content"]
+    ]
+    assert len(process_calls) == 1
+    assert process_calls[0]["retry_transient_once"] is True
+    assert result["issues"][0]["category"] == "runtime"
+    assert "process timeout" in result["failed_reason"][0]
+    assert "comments_review" not in result["failed_reason"][0]
+    assert result["solution_anchor_result"] is None
+    assert all(
+        "trách nhiệm kiểm chứng các nhận xét" not in call["messages"][0]["content"]
+        for call in client.calls
+    )
+
+
 def test_resolver_equivalent_does_not_trigger_correctness_fallback():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok()],
         global_quality=[global_quality_good()],
         resolvers=[resolver_equivalent()],
@@ -651,8 +656,12 @@ def test_resolver_equivalent_does_not_trigger_correctness_fallback():
     assert debug_public["correctness_fallback_called"] is False
 
 
-def test_missing_builder_context_short_circuits_judges_and_resolver():
-    client = RoleClient(splitters=[splitter_missing_context()])
+def test_direct_judges_call_correctness_process_and_resolver():
+    client = RoleClient(
+        correctness=[judge_ok()],
+        global_quality=[global_quality_good()],
+        resolvers=[resolver_ok()],
+    )
 
     result = evaluate_generated_questions(
         generated_question("missing-context"),
@@ -660,10 +669,8 @@ def test_missing_builder_context_short_circuits_judges_and_resolver():
         client=client,
     )
 
-    assert len(client.calls) == 1
-    assert result["is_good"] is False
-    assert result["issues"][0]["location"] == "/instruction/0/text"
-    assert result["issues"][0]["category"] == "solution_quality"
+    assert len(client.calls) == 3
+    assert result["is_good"] is True
 
 
 def test_debug_output_exposes_runtime_detail_without_changing_compact_output():
@@ -678,15 +685,15 @@ def test_debug_output_exposes_runtime_detail_without_changing_compact_output():
             "suggestion": "Chạy lại.",
             "repair_intent": "needs_manual_review",
         }],
-        "failed_reason": ["Splitter đã thay đổi source_text."],
+        "failed_reason": ["Correctness Judge trả output không canonical."],
     }
 
     compact = public_generated_question_result(internal, debug=False)
     debug = public_generated_question_result(internal, debug=True)
 
     assert compact["issues"][0]["reason"] == "Runtime error hoặc LLM output không hợp lệ."
-    assert debug["issues"][0]["reason"] == "Splitter đã thay đổi source_text."
-    assert debug["failed_reason"] == ["Splitter đã thay đổi source_text."]
+    assert debug["issues"][0]["reason"] == "Correctness Judge trả output không canonical."
+    assert debug["failed_reason"] == ["Correctness Judge trả output không canonical."]
 
 
 def test_wrapper_source_fields_are_not_sent_to_solution_judge():
@@ -698,7 +705,6 @@ def test_wrapper_source_fields_are_not_sent_to_solution_judge():
         "generatedQuestions": [question],
     }
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok()],
         global_quality=[global_quality_good()],
         resolvers=[resolver_ok()],
@@ -717,6 +723,49 @@ def test_wrapper_source_fields_are_not_sent_to_solution_judge():
     assert "solverName" not in serialized
     assert "question_plan" not in serialized
     assert "raw answer" not in serialized
+
+
+def test_essay_requirements_reach_both_judges_but_not_resolver():
+    question = {
+        "_id": "essay-context-test",
+        "instruction": [{"type": "text", "text": "Chứng minh mệnh đề bằng quy nạp."}],
+        "questionItems": [{
+            "id": "essay-item",
+            "stem": [{"type": "text", "text": "Trình bày đầy đủ bốn phần."}],
+            "interactions": [{
+                "id": "essay-response",
+                "type": "essay",
+                "config": {"minWords": 80, "maxWords": 500},
+                "requirements": ["Nêu rõ giả thiết quy nạp."],
+            }],
+            "rubric": [
+                "Kiểm tra bước cơ sở.",
+                "Nêu giả thiết và hoàn thành bước quy nạp.",
+            ],
+        }],
+        "solutions": [{
+            "solutionContent": [{"type": "text", "text": "Bước cơ sở đúng. Giả sử mệnh đề đúng tại k, rồi chứng minh tại k+1."}],
+        }],
+    }
+    compact = compact_generated_question_payload(question)
+    essay = compact["questionItems"][0]["essayInteractions"][0]
+    assert essay["config"] == {"minWords": 80, "maxWords": 500}
+    assert essay["requirements"] == ["Nêu rõ giả thiết quy nạp."]
+    assert compact["questionItems"][0]["rubric"] == question["questionItems"][0]["rubric"]
+
+    correctness_prompt = build_direct_correctness_messages(question)[-1]["content"]
+    process_prompt = build_direct_process_presentation_messages(
+        question,
+    )[-1]["content"]
+    for prompt in (correctness_prompt, process_prompt):
+        assert '"essayInteractions"' in prompt
+        assert '"minWords":80' in prompt
+        assert "Kiểm tra bước cơ sở." in prompt
+    assert '"type":"essay"' in correctness_prompt
+    assert '"rubric"' in process_prompt
+
+    resolver_payload = compact_generated_question_for_solution_anchor(question)
+    assert resolver_payload["interaction_contexts"] == []
 
 
 def test_bad_structure_stops_before_llm():
@@ -809,7 +858,6 @@ def test_llm_contracts_do_not_normalize_explicit_nulls():
 
 def test_judge_uses_fast_model_and_keeps_concrete_business_issue():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_issue()],
         global_quality=[global_quality_good()],
     )
@@ -825,13 +873,27 @@ def test_judge_uses_fast_model_and_keeps_concrete_business_issue():
     assert result["judge_fallback_called"] is False
 
 
+def test_no_candidate_comments_skip_review():
+    client = RoleClient(correctness=[judge_ok()], global_quality=[global_quality_good()])
+
+    result = judge_generated_question_object(
+        generated_question(), {"issues": []}, fake_config(), client
+    )
+
+    assert result["is_good"] is True
+    assert len(client.calls) == 2
+    assert all(
+        "trách nhiệm kiểm chứng các nhận xét" not in call["messages"][0]["content"]
+        for call in client.calls
+    )
+
+
 def test_judge_only_corrects_mechanical_contract_failure_with_same_model():
     for invalid, responses, expected_calls, expected_correction in (
-        (RuntimeError("timeout"), [RuntimeError("timeout"), judge_issue()], 3, 0),
+        (RuntimeError("timeout"), [RuntimeError("timeout"), judge_issue()], 2, 0),
         ({"is_good": True}, [{"is_good": True}, judge_issue()], 4, 1),
     ):
         client = RoleClient(
-            splitters=[splitter_ok()],
             correctness=responses,
             global_quality=[global_quality_good()],
         )
@@ -853,7 +915,6 @@ def test_judge_only_corrects_mechanical_contract_failure_with_same_model():
 
 def test_judge_exhausted_runtime_is_not_relabelled_as_contract_failure():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[RuntimeError("fast timeout"), RuntimeError("fallback timeout")],
         global_quality=[global_quality_good()],
     )
@@ -871,7 +932,6 @@ def test_judge_exhausted_runtime_is_not_relabelled_as_contract_failure():
 
 def test_judge_exhausted_invalid_contract_stays_solution_quality():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[{"is_good": True}, {"is_good": True}, {"is_good": True}],
         global_quality=[global_quality_good()],
     )
@@ -995,6 +1055,40 @@ def test_resolver_alignment_accepts_equivalent_and_rejects_boolean_contradiction
     assert "resolver_contract_error" in invalid
 
 
+def test_resolver_builds_missing_alignment_issue_from_valid_fix():
+    raw = resolver_mismatch()
+    raw["issues"] = []
+
+    result = normalize_solution_anchor_result(raw, generated_question())
+
+    assert result["resolver_status"] == "resolved"
+    assert "resolver_contract_error" not in result
+    assert result["answerSpec_matches_solution"] is False
+    assert len(result["issues"]) == 1
+    issue = result["issues"][0]
+    assert issue["severity"] == "bad"
+    assert issue["category"] == "solution_anchor_consistency"
+    assert issue["location"] == "/questionItems/0/answerSpecs/0/expected/correctOptionId"
+    assert issue["reason"] == "answerSpec lệch solution."
+    assert issue["suggestion"] == "Đổi correctOptionId thành B."
+    assert issue["repair_intent"] == "align_fields_to_solution"
+
+
+def test_resolver_reanchors_nonexistent_issue_location_to_valid_fix_path():
+    raw = resolver_mismatch()
+    raw["issues"][0]["location"] = (
+        "/questionItems/0/answerSpecs/0/expected/nonexistent"
+    )
+
+    result = normalize_solution_anchor_result(raw, generated_question())
+
+    assert result["resolver_status"] == "resolved"
+    assert "resolver_contract_error" not in result
+    assert result["issues"][0]["location"] == (
+        "/questionItems/0/answerSpecs/0/expected/correctOptionId"
+    )
+
+
 def test_resolver_final_answer_contract_rejects_missing_wrong_or_null_text():
     invalid_answers = [
         {},
@@ -1022,7 +1116,6 @@ def test_resolver_final_answer_contract_rejects_missing_wrong_or_null_text():
 def test_resolver_prompt_states_final_answer_invariants_for_shared_model_messages():
     messages = build_solution_anchor_resolver_messages(
         generated_question(),
-        "Resolver rules.",
     )
     prompt = messages[-1]["content"]
 
@@ -1118,7 +1211,6 @@ def test_resolver_mismatch_repair_uses_fix_without_mutating_input():
     original["questionItems"][0]["answerSpecs"][0]["expected"]["correctOptionId"] = "A"
     snapshot = deepcopy(original)
     client = RoleClient(
-        splitters=[splitter_ok(), splitter_ok()],
         correctness=[judge_ok(), judge_ok()],
         global_quality=[global_quality_good(), global_quality_good()],
         resolvers=[resolver_mismatch(), resolver_ok()],
@@ -1190,6 +1282,20 @@ def test_report_and_repaired_object_extraction():
                         "suggestion": "Căn lại answerSpec.",
                     }
                 ],
+                "correctness_comments": [{
+                    "solution_index": 0,
+                    "evidence": "2x^3 = 18",
+                    "reason": "Phép biến đổi sai.",
+                    "review_disposition": "rejected",
+                }],
+                "process_comments": [{
+                    "solution_index": 0,
+                    "error_type": "missing_major_step",
+                    "evidence": "2x^3 = 16",
+                    "reason": "Thiếu bước chuyển vế.",
+                    "suggestion": "Bổ sung bước.",
+                    "review_disposition": "blocking",
+                }],
                 "new_generated_question": repaired,
             }
         ],
@@ -1198,12 +1304,14 @@ def test_report_and_repaired_object_extraction():
     report = format_generated_question_markdown(result, source_name="input.json")
 
     assert "solution_anchor_consistency(bad)" in report
+    assert "Nhận xét Correctness" in report
+    assert "[rejected] — “2x^3 = 18” — Phép biến đổi sai." in report
+    assert "[blocking] — [missing_major_step] — “2x^3 = 16” — Thiếu bước chuyển vế." in report
     assert extract_repaired_generated_questions(result) == [repaired]
 
 
-def test_judge_calls_two_specialized_gemma():
+def test_judge_calls_three_specialized_gemma():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_issue("Phép biến đổi chưa hợp lệ.")],
         global_quality=[global_quality_good()],
     )
@@ -1212,7 +1320,7 @@ def test_judge_calls_two_specialized_gemma():
         generated_question(), {"issues": []}, fake_config(gemma_runs=2), client
     )
 
-    assert result["judge_gemma_run_count"] == 2
+    assert result["judge_gemma_run_count"] == 3
     assert result["judge_fallback_called"] is False
     assert len(client.calls) == 3
     assert all(call["model"] == "fast-model" for call in client.calls)
@@ -1223,12 +1331,11 @@ def test_judge_contract_failure_never_switches_to_reasoning_model():
         (
             {"is_good": True},
             [{"is_good": True}, {"is_good": True}, judge_issue()],
-            4,
+            3,
         ),
-        (RuntimeError("timeout"), [RuntimeError("timeout"), judge_issue()], 3),
+        (RuntimeError("timeout"), [RuntimeError("timeout"), judge_issue()], 2),
     ):
         client = RoleClient(
-            splitters=[splitter_ok()],
             correctness=responses,
             global_quality=[global_quality_good()],
         )
@@ -1243,7 +1350,6 @@ def test_judge_contract_failure_never_switches_to_reasoning_model():
 
 def test_process_presentation_contract_failure_is_corrected_once_with_same_model():
     client = RoleClient(
-        splitters=[splitter_ok()],
         correctness=[judge_ok()],
         global_quality=[{"verdict": "good"}, global_quality_bad()],
     )
@@ -1256,7 +1362,11 @@ def test_process_presentation_contract_failure_is_corrected_once_with_same_model
     assert result["judge_fallback_called"] is False
     assert len(client.calls) == 4
     assert result["contract_correction_12b_calls"] == 1
-    correction_prompt = client.calls[-1]["messages"][-1]["content"]
+    correction_prompt = next(
+        call["messages"][-1]["content"]
+        for call in client.calls
+        if "SỬA HỢP ĐỒNG ĐẦU RA" in call["messages"][-1]["content"]
+    )
     assert "SỬA HỢP ĐỒNG ĐẦU RA" in correction_prompt
     assert "raw_candidate" in correction_prompt
     assert sum(call["model"] == "reasoning-model" for call in client.calls) == 0
@@ -1302,11 +1412,11 @@ def test_specialized_gemma_batch_caps_calls_at_four_and_preserves_order():
             try:
                 self.barrier.wait(timeout=2)
                 system_prompt = kwargs["messages"][0]["content"]
-                if "Solution State Splitter" in system_prompt:
-                    payload = splitter_ok()
-                elif "Solution Resolver" in system_prompt:
+                if "Solution Resolver" in system_prompt:
                     payload = resolver_ok()
-                elif "Process & Presentation Judge" in system_prompt:
+                elif "trách nhiệm kiểm chứng các nhận xét" in system_prompt:
+                    payload = {"reviewed_comments": []}
+                elif "trách nhiệm xem xét quá trình" in system_prompt:
                     payload = global_quality_good()
                 else:
                     payload = judge_ok()
@@ -1322,5 +1432,5 @@ def test_specialized_gemma_batch_caps_calls_at_four_and_preserves_order():
     )
 
     assert 2 <= client.max_active <= 4
-    assert len(client.calls) == 8
+    assert 5 <= len(client.calls) <= 6
     assert [item["id"] for item in result["results"]] == ["first", "second"]

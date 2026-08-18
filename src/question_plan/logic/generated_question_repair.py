@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -24,15 +23,6 @@ from .generated_question_schema import (
     location_to_json_pointer,
     validate_generated_question_object,
 )
-
-
-KNOWLEDGE_DIR = Path(__file__).resolve().parents[1] / "knowledge"
-REPAIR_RULES_PATH = KNOWLEDGE_DIR / "generated_question_repair_rules.md"
-
-
-def load_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
 
 def compact_issue_for_repair(issue: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -132,9 +122,23 @@ def build_scoped_repair_context(
     return {"context_ok": True, "payload": payload}
 
 
+GENERATED_QUESTION_REPAIR_RULES = """# Generated Question Repair Rules
+
+- Chỉ sửa generated question object được cung cấp.
+- Không dùng question_plan, raw question, raw answer, PDF, OCR hoặc dữ liệu ngoài.
+- Chỉ dùng scoped patch; không full-object fallback và không tạo lời giải mới.
+- Giữ nguyên id/_id; không sửa difficulty/bloom hoặc thêm metadata report vào object.
+- `align_fields_to_solution` chỉ sửa answerSpec theo `fields_to_fix` đã được resolver trả và code xác thực. Không sửa solution hoặc nội dung option đã tồn tại.
+- `align_hint_to_solution` chỉ sửa hint khi resolver đã resolved và issue xác nhận hint mâu thuẫn trực tiếp với solution.
+- `clean_solution_reasoning` chỉ làm sạch wording thử-sai/tự vấn trong solution, giữ nguyên kết luận cuối theo `solution_anchor_result.final_answer`; không đổi answerSpec/options nếu chúng đã khớp.
+- Nếu resolver là `needs_manual_review`, không đoán đáp án và không repair answerSpec/options/hints/solution.
+- Nếu scoped context/path không đủ an toàn, trả `needs_manual_review`.
+- Patch phải là JSON Patch áp dụng trên generated question gốc và chỉ chạm đúng phạm vi issue.
+- Không tự giải lại bài từ instruction/stem để quyết định đáp án.
+- Chuỗi diễn giải phải viết bằng tiếng Việt có dấu, trừ tên field/id/path/code/LaTeX."""
+
 def build_generated_question_scoped_repair_messages(
     scoped_payload: dict[str, Any],
-    repair_rules_text: str,
 ) -> list[dict[str, str]]:
     output_schema_text = contract_schema_text(ScopedRepairOutput)
     return [
@@ -154,7 +158,7 @@ def build_generated_question_scoped_repair_messages(
                 "- clean_solution_reasoning: bỏ thử-sai/tự vấn/đoạn nháp nhưng giữ nguyên final answer; không tự giải lại.\n"
                 "- fix_schema: chỉ patch cấu trúc/render nhỏ và an toàn.\n"
                 "Nếu không đủ context hoặc không có patch an toàn, trả needs_manual_review.\n\n"
-                f"QUY TẮC SỬA:\n{repair_rules_text}\n\n"
+                f"QUY TẮC SỬA:\n{GENERATED_QUESTION_REPAIR_RULES}\n\n"
                 f"LƯỢC ĐỒ ĐẦU RA:\n{output_schema_text}\n\n"
                 f"DỮ LIỆU TRONG PHẠM VI:\n{json.dumps(scoped_payload, ensure_ascii=False, indent=2)}"
             ),
@@ -263,7 +267,6 @@ def repair_generated_question_scoped(
         return manual_review_result(str(context.get("reason") or "Scoped context không an toàn."), generated_question, index)
     messages = build_generated_question_scoped_repair_messages(
         context["payload"],
-        load_text(REPAIR_RULES_PATH),
     )
     model = (
         generated_question_fast_model(config)

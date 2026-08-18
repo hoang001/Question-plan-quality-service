@@ -29,7 +29,6 @@ class AppConfig:
     gemma_evaluation_concurrency: int
     gemma_request_timeout_seconds: int
     llm_top_p: float
-    solution_splitter_model: str = ""
     solution_correctness_model: str = ""
     process_presentation_model: str = ""
     solution_resolver_model: str = ""
@@ -45,15 +44,6 @@ def generated_question_fast_model(config: AppConfig) -> str:
     """Model nhanh cho generated question; giữ mapping Gemma ở PRIMARY_JUDGE_MODEL hiện tại."""
 
     return str(config.primary_judge_model)
-
-
-def generated_question_splitter_model(config: AppConfig) -> str:
-    """Small model used only to recover canonical solution stages."""
-
-    return str(
-        getattr(config, "solution_splitter_model", "")
-        or config.primary_judge_model
-    )
 
 
 def generated_question_correctness_model(config: AppConfig) -> str:
@@ -132,7 +122,6 @@ def load_config(root_dir: Path) -> AppConfig:
 
     primary = os.getenv("PRIMARY_JUDGE_MODEL", "").strip() or "gemma-4-12b-it"
     fallback = os.getenv("FALLBACK_JUDGE_MODEL", "").strip() or "gemma-4-26b"
-    splitter = os.getenv("SOLUTION_SPLITTER_MODEL", "").strip() or primary
     correctness = os.getenv("SOLUTION_CORRECTNESS_MODEL", "").strip() or fallback
     presentation = os.getenv("PROCESS_PRESENTATION_MODEL", "").strip() or primary
     resolver = os.getenv("SOLUTION_RESOLVER_MODEL", "").strip() or fallback
@@ -152,9 +141,8 @@ def load_config(root_dir: Path) -> AppConfig:
         models_endpoint=os.getenv("LLM_MODELS_ENDPOINT", "").strip() or None,
         chat_completions_endpoint=os.getenv("LLM_CHAT_COMPLETIONS_ENDPOINT", "").strip() or None,
         gemma_evaluation_concurrency=env_int("GEMMA_EVALUATION_CONCURRENCY", 4),
-        gemma_request_timeout_seconds=env_int("GEMMA_REQUEST_TIMEOUT_SECONDS", 30),
+        gemma_request_timeout_seconds=env_int("GEMMA_REQUEST_TIMEOUT_SECONDS", 60),
         llm_top_p=top_p,
-        solution_splitter_model=splitter,
         solution_correctness_model=correctness,
         process_presentation_model=presentation,
         solution_resolver_model=resolver,

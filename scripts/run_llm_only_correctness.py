@@ -1,7 +1,7 @@
 """Gọi trực tiếp một LLM để chấm solution, không chạy pipeline của service.
 
 Runner này cố ý KHÔNG import bất kỳ logic nào trong ``src/question_plan`` và
-không chạy Splitter, Builder, Code Analyzer, Claim Role Verifier, Process /
+không chạy Process /
 Presentation Judge, Aggregate, Resolver, parser hay Pydantic contract.
 
 Mỗi object tạo đúng một HTTP request. Response được lưu nguyên bản để phục vụ
@@ -31,10 +31,9 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-SYSTEM_PROMPT = """Bạn là người chấm tính đúng đắn của một lời giải mẫu môn Toán.
-
-Chỉ dùng đề bài, stem và solution được cung cấp. Không suy đoán hoặc đánh giá
-answerSpec, đáp án chấm, metadata hay bất kỳ kết quả phân tích bằng code nào.
+SYSTEM_PROMPT = """Bạn là một chuyên gia kiểm định chất lượng giáo dục và là giáo
+viên Toán học có tính cách cực kỳ cẩn thận, nghiêm túc. Nhiệm vụ của bạn là kiểm tra
+tính chính xác của lời giải toán do học sinh nộp trực tiếp từng dòng một.
 
 Nhiệm vụ:
 - Xác định solution là good, bad hay uncertain.
@@ -51,8 +50,8 @@ Nhiệm vụ:
 Chỉ trả một JSON object, không dùng Markdown và không viết thêm văn bản:
 {
   "status": "good | bad | uncertain",
-  "reason": null,
-  "suggestion": null
+  "reason": [],
+  "suggestion": []
 }
 
 Nếu status=good thì reason và suggestion phải là null. Nếu status=bad hoặc
@@ -64,8 +63,8 @@ BARE_SYSTEM_PROMPT = """Bạn là người đánh giá lời giải toán. Dựa
 Chỉ trả một JSON object, không dùng Markdown và không viết thêm văn bản:
 {
   "status": "good | bad | uncertain",
-  "reason": null,
-  "suggestion": null
+  "reason": [],
+  "suggestion": []
 }
 
 Nếu status=good thì reason và suggestion là null."""

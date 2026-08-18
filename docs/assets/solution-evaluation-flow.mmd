@@ -1,109 +1,54 @@
-%%{init: {"flowchart": {"defaultRenderer": "elk", "curve": "linear", "nodeSpacing": 28, "rankSpacing": 42}}}%%
-flowchart TB
-    subgraph P1["1 · VALIDATE"]
-        direction TB
-        A["Generated Question<br/>đề bài · solution · answerSpec"]
-        B["Structural Validator<br/>shape · ID · reference · cardinality"]
-        BG{"Có schema issue<br/>blocking?"}
-        A --> B --> BG
+flowchart TD
+    A["Generated Question<br/>instruction · questionItems · solutions · answerSpecs · hình ảnh"] --> B["Structural Validator<br/>Code kiểm tra cấu trúc bắt buộc"]
+
+    B -->|Cấu trúc lỗi| Z["Public output<br/>needs_review"]
+    B -->|Hợp lệ| C
+    B -->|Hợp lệ| P
+
+    subgraph J["Hai Judge chạy song song"]
+        C["Correctness · Gemma 26B<br/><b>Nhận:</b> đề + nguyên văn lời giải + dữ liệu trực quan<br/><b>Quy tắc:</b> kiểm tra tuần tự mọi khẳng định toán học<br/><b>Trả:</b> opening_checks + comments"]
+        P["Process / Presentation · Gemma 12B<br/><b>Nhận:</b> đề + nguyên văn lời giải<br/><b>Quy tắc:</b> thiếu bước chính · bước thừa · nháp · trình bày<br/><b>Trả:</b> comments"]
     end
 
-    subgraph P2["2 · CONTEXT & TRANSITIONS"]
-        direction TB
-        C["Gemma 12B Splitter<br/>ordered states · context requirements<br/>đọc ảnh một lần nếu có"]
-        C0{"Gemma Splitter<br/>canonical?"}
-        CF["Nếu output không canonical<br/>Code Splitter tách states từ text"]
-        CG{"Code fallback<br/>thành công?"}
-        D{"Context bắt buộc<br/>available?"}
-        E["Internal Context Builder<br/>kiểm mô tả ảnh · chèn vào bản sao stem"]
-        F["Transition Builder + Code Analyzer<br/>ordered transitions · hard-invalid hints"]
-        C --> C0
-        C0 -->|Có| D
-        C0 -->|Không| CF --> CG
-        CG -->|Có| D
-        D -->|Có| E --> F
-    end
+    C --> V{"Output đúng schema?"}
+    P --> V
+    V -->|Không| R1["Gọi lại đúng Judge một lần<br/>chỉ sửa hợp đồng output"]
+    R1 --> V2{"Sau sửa hợp lệ?"}
+    V2 -->|Không| Z
+    V -->|Có| K["Code gắn comment_id<br/>và gom nhận xét ứng viên"]
+    V2 -->|Có| K
 
-    subgraph P3["3 · SPECIALIZED JUDGES"]
-        direction TB
-        X["Chạy song song"]
-        G1["Gemma 26B Correctness<br/>đúng/sai toán học · lập luận · lỗi đầu tiên"]
-        G2["Gemma 12B Process & Presentation<br/>thiếu bước · nháp · lặp · wording"]
-        V{"Cả hai output<br/>canonical?"}
-        RT{"Có runtime<br/>failure?"}
-        CC["Một correction call tối đa / object<br/>một scope: chính model đó<br/>hai scope: combined Gemma 26B"]
-        VC{"Sau correction<br/>cả hai canonical?"}
-        X --> G1 --> V
-        X --> G2 --> V
-        V -->|Không| RT
-        RT -->|Không| CC --> VC
-    end
+    K --> Q{"Có nhận xét ứng viên?"}
+    Q -->|Không| G["Code tổng hợp: good"]
+    Q -->|Có| R["Review · Gemma 26B<br/><b>Nhận:</b> nhận xét ứng viên + đề + lời giải<br/><b>Quy tắc:</b> chỉ kiểm chứng nhận xét đã có, không tự tìm lỗi mới<br/><b>Trả:</b> blocking · advisory · rejected + lý do + đề xuất"]
+    R --> RV{"Output Review đúng schema?"}
+    RV -->|Không| RR["Gọi Review lại một lần<br/>chỉ sửa hợp đồng output"]
+    RR --> RV2{"Sau sửa hợp lệ?"}
+    RV2 -->|Không| Z
+    RV -->|Có| G
+    RV2 -->|Có| G
 
-    subgraph P4["4 · AGGREGATE & RESOLVE"]
-        direction TB
-        M["Code áp dụng hard-invalid bắt buộc<br/>chỉ khi evidence grounded và được dùng tiếp"]
-        H["Aggregate hai Judge canonical<br/>chọn issue sớm nhất"]
-        I{"Final solution<br/>is_good = true?"}
-        IC{"Có interaction context<br/>để đối chiếu?"}
-        K["Gemma 26B Solution Resolver<br/>solution ↔ answerSpec/options/hints<br/>gọi đúng một lần"]
-        KR{"Resolver canonical<br/>và resolved?"}
-        MR["Merge resolver result<br/>answer mismatch · fields_to_fix"]
-        M --> H --> I
-        I -->|Có| IC
-        IC -->|Có| K --> KR
-        KR -->|Có| MR
-    end
+    G --> AG["Aggregate bằng code<br/>bỏ rejected · ưu tiên blocking Correctness<br/>advisory thành warning"]
+    AG --> GT{"Quality Gate mở?<br/>Kết quả good và có dữ liệu interaction"}
+    GT -->|Không| O["Public output"]
+    GT -->|Có| S["Solution Resolver · Gemma 26B<br/>đối chiếu kết luận rõ ràng của solution với answerSpec"]
+    S --> O
 
-    subgraph P5["5 · REPAIR & OUTPUT"]
-        direction TB
-        Q["Canonical checked result"]
-        AR{"auto_repair=true<br/>và có issue repairable?"}
-        RP["Scoped Repair + re-evaluate<br/>clean solution trước<br/>sau đó align answer/hint/schema<br/>lặp tối đa max_loop"]
-        O["Public Output<br/>is_good · issues · new_generated_question"]
-        Q --> AR
-        AR -->|Không| O
-        AR -->|Có| RP --> O
-    end
+    O -.->|Nếu bật auto-repair| RP["Repair có phạm vi<br/>sửa dữ liệu rồi đánh giá lại"]
 
-    STOP["Fail closed / Needs review<br/>giữ canonical issue<br/>không gọi Resolver"]
+    NP["--no-prompt<br/>chỉ gửi đề + lời giải + yêu cầu kiểm tra<br/>ghi nguyên output, bỏ schema · Review · Aggregate · Resolver"] -.-> C
+    NP -.-> P
 
-    BG -->|Không| C
-    BG -->|Có| STOP
-    CG -->|Không| STOP
-    D -->|Không| STOP
-    F --> X
-    V -->|Có| M
-    RT -->|Có| STOP
-    VC -->|Có| M
-    VC -->|Không| STOP
-    I -->|Không| Q
-    IC -->|Không| Q
-    KR -->|Không| STOP
-    MR --> Q
-    STOP --> Q
-
-    N1["Ảnh chỉ gửi cho Splitter.<br/>Correctness chỉ nhận mô tả text."]
-    N2["Analyzer không quyết định public verdict.<br/>Correctness không chấm trình bày;<br/>Process không tính lại toán học."]
-    N3["Mọi handoff non-canonical còn lại<br/>đều fail closed trước Resolver."]
-
-    N1 -.-> C
-    N2 -.-> F
-    N3 -.-> STOP
-
-    classDef source fill:#eef6ff,stroke:#3578b8,stroke-width:2px,color:#17324d;
-    classDef code fill:#f3f6f8,stroke:#607d8b,stroke-width:2px,color:#23343d;
-    classDef llm fill:#e9f8ef,stroke:#23865f,stroke-width:2px,color:#153d2e;
-    classDef decision fill:#fff4df,stroke:#d88920,stroke-width:2px,color:#503510;
-    classDef stop fill:#fff0f0,stroke:#cc4f4f,stroke-width:2px,color:#572020;
-    classDef output fill:#edf0ff,stroke:#596bd6,stroke-width:2px,color:#20295c;
-    classDef repair fill:#f7efff,stroke:#8b5bb7,stroke-width:2px,color:#40245a;
-    classDef note fill:#ffffff,stroke:#9aa8b2,stroke-width:1.5px,color:#34444e,stroke-dasharray:4 3;
+    classDef source fill:#eef6ff,stroke:#3578b8,color:#17324d;
+    classDef code fill:#f3f6f8,stroke:#607d8b,color:#23343d;
+    classDef llm fill:#e9f8ef,stroke:#23865f,color:#153d2e;
+    classDef decision fill:#fff4df,stroke:#d88920,color:#503510;
+    classDef output fill:#edf0ff,stroke:#596bd6,color:#20295c;
+    classDef note fill:#ffffff,stroke:#9aa8b2,color:#34444e,stroke-dasharray:4 3;
 
     class A source;
-    class B,CF,E,F,X,M,H,MR,Q code;
-    class C,G1,G2,CC,K llm;
-    class BG,C0,CG,D,V,RT,VC,I,IC,KR,AR decision;
-    class STOP stop;
-    class RP repair;
-    class O output;
-    class N1,N2,N3 note;
+    class B,K,G,AG,R1,RR code;
+    class C,P,R,S,RP llm;
+    class V,V2,Q,RV,RV2,GT decision;
+    class O,Z output;
+    class NP note;

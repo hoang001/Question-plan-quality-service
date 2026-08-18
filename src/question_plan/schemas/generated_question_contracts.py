@@ -27,283 +27,33 @@ class ContractModel(BaseModel):
         return normalized
 
 
-class SolutionState(ContractModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    solution_index: int
-    order: int
-    source_path: str
-    source_text: str
-
-
-class ContextRequirement(ContractModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    requirement_type: Literal[
-        "image",
-        "geometry_figure",
-        "graph",
-        "chart",
-        "table",
-        "variation_table",
-        "number_line",
-        "coordinate_plane",
-        "diagram",
-        "visual_marking",
-        "referenced_data",
-        "other",
-    ]
-    description: str = Field(min_length=1)
-    availability: Literal["available", "missing", "insufficient"]
-    evidence_text: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def reject_blank_text(self) -> ContextRequirement:
-        if not self.description.strip():
-            raise ValueError("description must not be blank")
-        if not self.evidence_text.strip():
-            raise ValueError("evidence_text must not be blank")
-        return self
-
-
-class VisualContextDescription(ContractModel):
-    """Grounded transcription/description produced once by the visual Splitter."""
+class DirectSolutionCorrectnessComment(ContractModel):
+    """One mathematical comment found while reading an original solution."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    source_path: str = Field(min_length=1)
-    asset_url: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def reject_blank_values(self) -> VisualContextDescription:
-        if not all(
-            value.strip()
-            for value in (self.source_path, self.asset_url, self.description)
-        ):
-            raise ValueError("visual description fields must not be blank")
-        return self
-
-
-class SolutionStem(ContractModel):
-    """Grounded problem statement used as the initial transition premise."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    source_path: str = Field(min_length=1)
-    source_text: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def reject_blank_values(self) -> SolutionStem:
-        if not self.source_path.strip() or not self.source_text.strip():
-            raise ValueError("stem fields must not be blank")
-        return self
-
-
-class SolutionSplitOutput(ContractModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    context_requirements: list[ContextRequirement]
-    visual_descriptions: list[VisualContextDescription] = Field(default_factory=list)
-    stem: SolutionStem
-    states: list[SolutionState]
-
-
-class CodeTransitionAnalysis(ContractModel):
-    """Internal deterministic annotation; never part of the public result."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    status: Literal[
-        "verified_valid",
-        "verified_invalid",
-        "compressed_but_equivalent",
-        "unsupported",
-        "ambiguous",
-        "parse_error",
-    ]
-    strength: Literal["hard", "soft", "none"]
-    transition_type: Literal[
-        "equation_transformation",
-        "inequality_transformation",
-        "expression_transformation",
-        "numeric_substitution",
-        "numeric_calculation",
-        "equality_chain",
-        "semantic_reasoning",
-        "unsupported",
-    ]
-    issue_type: Literal[
-        "sign_error",
-        "calculation_error",
-        "invalid_equivalence",
-        "inequality_direction_error",
-        "division_by_zero",
-    ] | None
-    operation_count: int | None = Field(default=None, ge=0)
-    operation_types: list[str]
-    explicit_step_count: int | None = Field(default=None, ge=1)
-    max_operations_per_step: int | None = Field(default=None, ge=0)
-    total_operation_count: int | None = Field(default=None, ge=0)
-    intermediate_states_explicit: bool = False
-    failing_pair_index: int | None = Field(default=None, ge=1)
-    failing_before: str | None = None
-    failing_after: str | None = None
-    reason: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_strength(self) -> CodeTransitionAnalysis:
-        expected_strength = {
-            "verified_valid": "hard",
-            "verified_invalid": "hard",
-            "compressed_but_equivalent": "soft",
-            "unsupported": "none",
-            "ambiguous": "none",
-            "parse_error": "none",
-        }[self.status]
-        if self.strength != expected_strength:
-            raise ValueError("strength không khớp status")
-        if self.status == "verified_invalid" and self.issue_type is None:
-            raise ValueError("verified_invalid phải có issue_type")
-        if self.status != "verified_invalid" and self.issue_type is not None:
-            raise ValueError("chỉ verified_invalid được có issue_type")
-        return self
-
-
-class CalculationCheck(ContractModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    expected_result: str
-    actual_result: str
-    matches: bool
-
-
-class CorrectnessTransitionIssue(ContractModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    solution_index: int
-    from_order: int | None
-    to_order: int
-    error_type: Literal[
-        "calculation_error",
-        "sign_error",
-        "coefficient_error",
-        "incorrect_transformation",
-        "non_equivalent_transformation",
-        "logical_error",
-        "invalid_theorem_application",
-        "domain_error",
-        "lost_solution",
-        "extraneous_solution",
-        "incomplete_reasoning",
-        "other_correctness_error",
-        "other",
-    ]
-    evidence_text: str
-    calculation_check: CalculationCheck | None
-
-
-class CorrectnessContextIssue(ContractModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    error_type: Literal[
-        "insufficient_context",
-        "inconsistent_context",
-        "contradictory_context",
-    ]
-    source_path: str
-    evidence_text: str
-
-
-CorrectnessErrorType = Literal[
-    "calculation_error",
-    "sign_error",
-    "coefficient_error",
-    "incorrect_transformation",
-    "non_equivalent_transformation",
-    "logical_error",
-    "invalid_theorem_application",
-    "domain_error",
-    "lost_solution",
-    "extraneous_solution",
-    "incomplete_reasoning",
-    "other_correctness_error",
-    "other",
-]
-
-
-class CorrectnessJudgeOutput(ContractModel):
-    """Flat schema-constrained semantic decision emitted by Correctness models."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    error_type: CorrectnessErrorType | None = Field(
-        description="Null khi status là good; bắt buộc khi status là bad."
-    )
-    solution_index: int | None = Field(
-        ge=0,
-        description="Null khi status là good; nếu không thì là chỉ số lời giải được neo.",
-    )
-    from_order: int | None = Field(
-        ge=0,
-        description="Null khi status là good hoặc khi đây là transition đầu tiên.",
-    )
-    to_order: int | None = Field(
-        ge=0,
-        description="Null khi status là good; bắt buộc khi status là bad.",
-    )
-    reason: str | None = Field(
-        description="Null khi status là good; nếu không thì tối đa ba câu."
-    )
-    suggestion: str | None = Field(
-        description="Null khi status là good; bắt buộc với bad và tối đa hai câu."
-    )
-    semantic_role: Literal[
-        "asserted_active",
-        "hypothetical",
-        "rejected",
-        "self_corrected",
-        "uncertain",
-    ] | None = Field(
-        description="Vai trò ngữ nghĩa của certificate hard-invalid sớm nhất; nếu không có thì null."
-    )
-    certificate_disposition: Literal["accept", "ignore"] | None = Field(
-        description="Chấp nhận hoặc bỏ qua certificate hard-invalid sớm nhất; nếu không có thì null."
-    )
-    role_evidence: str | None = Field(
-        description="Đoạn lời giải làm bằng chứng cho vai trò ngữ nghĩa; bắt buộc khi bỏ qua certificate."
-    )
-    status: Literal["good", "bad", "uncertain"] = Field(
-        description="Chọn sau khi đánh giá. Khi good, code bỏ qua mọi field đứng trước."
-    )
-
-    @model_validator(mode="after")
-    def validate_status_contract(self) -> CorrectnessJudgeOutput:
-        if self.status == "good":
-            return self
-        if not self.reason or not self.reason.strip():
-            raise ValueError("bad/uncertain requires a non-blank reason")
-        if self.status == "bad" and (
-            self.error_type is None
-            or self.solution_index is None
-            or self.to_order is None
-            or not self.suggestion
-            or not self.suggestion.strip()
-        ):
-            raise ValueError("bad requires error_type, solution_index, to_order and suggestion")
-        return self
-
-
-class CanonicalCorrectnessResult(ContractModel):
-    """Code-grounded internal handoff consumed by Gate and Aggregate."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    first_invalid_transition: CorrectnessTransitionIssue | None
-    context_issue: CorrectnessContextIssue | None
+    solution_index: int = Field(ge=0)
+    evidence: str
     reason: str
-    suggestion: str
-    verdict: Literal["good", "bad", "uncertain"]
+
+
+class DirectSolutionOpeningCheck(ContractModel):
+    """Objective comparison between the problem and a solution's first claim."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    solution_index: int = Field(ge=0)
+    evidence: str
+    analysis: str
+
+
+class DirectSolutionCorrectnessOutput(ContractModel):
+    """Correctness observations before the independent review call."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    opening_checks: list[DirectSolutionOpeningCheck] = Field(min_length=1)
+    comments: list[DirectSolutionCorrectnessComment]
 
 
 ProcessPresentationErrorType = Literal[
@@ -319,66 +69,44 @@ ProcessPresentationErrorType = Literal[
 ]
 
 
-class ProcessPresentationSemanticOutput(ContractModel):
-    """Flat schema-constrained decision emitted by the presentation model."""
+class ProcessPresentationComment(ContractModel):
+    """One process/presentation comment before independent review."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     error_type: ProcessPresentationErrorType | None
-    solution_index: int | None = Field(ge=0)
-    state_order: int | None = Field(ge=0)
+    solution_index: int = Field(ge=0)
+    evidence: str
     reason: str
     suggestion: str
-    verdict: Literal["good", "bad", "uncertain"]
 
 
-class CombinedJudgeCorrectionOutput(ContractModel):
-    """Flat one-call correction envelope used only when both Judge contracts fail."""
+class ProcessPresentationSemanticOutput(ContractModel):
+    """Process/presentation observations before the independent review call."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    correctness_error_type: CorrectnessErrorType | None
-    correctness_solution_index: int | None = Field(ge=0)
-    correctness_from_order: int | None = Field(ge=0)
-    correctness_to_order: int | None = Field(ge=0)
-    correctness_reason: str | None
-    correctness_suggestion: str | None
-    correctness_semantic_role: Literal[
-        "asserted_active",
-        "hypothetical",
-        "rejected",
-        "self_corrected",
-        "uncertain",
-    ] | None
-    correctness_certificate_disposition: Literal["accept", "ignore"] | None
-    correctness_role_evidence: str | None
-    correctness_status: Literal["good", "bad", "uncertain"]
-    process_error_type: ProcessPresentationErrorType | None
-    process_solution_index: int | None = Field(ge=0)
-    process_state_order: int | None = Field(ge=0)
-    process_reason: str
-    process_suggestion: str
-    process_verdict: Literal["good", "bad", "uncertain"]
+    comments: list[ProcessPresentationComment]
 
 
-class ProcessPresentationIssue(ContractModel):
+CommentDisposition = Literal["blocking", "advisory", "rejected"]
+
+
+class ReviewedJudgeComment(ContractModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    scope: Literal["state", "global"]
-    solution_index: int
-    state_order: int | None
-    source_path: str
-    evidence_text: str | None
-    error_type: ProcessPresentationErrorType
+    comment_id: str
+    disposition: CommentDisposition
+    review_reason: str = Field(min_length=1, max_length=400)
+    review_suggestion: str = Field(max_length=300)
 
 
-class ProcessPresentationJudgeOutput(ContractModel):
+class JudgeCommentsReviewOutput(ContractModel):
+    """Review dispositions for the comments produced by the two judges."""
+
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    issue: ProcessPresentationIssue | None
-    reason: str
-    suggestion: str
-    verdict: Literal["good", "bad", "uncertain"]
+    reviewed_comments: list[ReviewedJudgeComment]
 
 
 class FinalAnswer(ContractModel):

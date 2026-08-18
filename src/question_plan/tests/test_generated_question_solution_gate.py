@@ -10,13 +10,9 @@ from src.question_plan.benchmarks.grade_solution_fixtures import (
     load_grade_solution_fixtures,
 )
 from src.question_plan.logic.generated_question_judge import (
-    CRITERIA_PATH,
-    PROCESS_PRESENTATION_CRITERIA_PATH,
-    build_generated_question_judge_messages,
-    build_transition_stages,
-    load_text,
+    PROCESS_PRESENTATION_CRITERIA,
+    build_direct_correctness_messages,
 )
-from src.question_plan.logic.code_transition_analyzer import analyze_transition_stages
 from src.question_plan.logic.generated_question_schema import merge_generated_question_results
 
 
@@ -47,139 +43,34 @@ def solution_issue(intent: str) -> dict:
     }
 
 
-def test_judge_prompt_is_compact_and_does_not_repeat_raw_solution_in_context():
-    ordered_solution = {
-        "states": [
-            {"solution_index": 0, "order": 0, "source_path": "/solutions/0/solutionContent/0/text", "source_text": "Suy ra x = 2."},
-        ],
-    }
-    messages = build_generated_question_judge_messages(
-        generated_question(),
-        load_text(CRITERIA_PATH),
-        ordered_solution,
-        analyze_transition_stages(
-            build_transition_stages(ordered_solution, generated_question())
-        ),
-    )
-    system_prompt, user_prompt = (message["content"] for message in messages)
-    context_text = user_prompt.split("### NGỮ CẢNH CÂU HỎI\n", 1)[1].split(
-        "\n\n### LỜI GIẢI THEO THỨ TỰ", 1
-    )[0]
-    context = json.loads(context_text)
-
-    assert "Gemma Correctness Judge" in system_prompt
-    assert "Không đánh giá context availability, mức độ gộp bước hoặc chất lượng trình bày" in system_prompt
-    assert "chỉ có `code_analysis` khi code phát hiện nghi vấn số học hard-invalid" in system_prompt
-    assert list(context) == ["id", "questionItems", "instruction"]
-    assert "solutions" not in context
-    assert context["instruction"] == generated_question()["instruction"]
-    assert context["questionItems"][0]["stem"] == generated_question()["questionItems"][0]["stem"]
-    assert context["questionItems"][0]["interactionTypes"] == ["short_answer"]
-    assert user_prompt.count("### TIÊU CHÍ") == 1
-    assert user_prompt.count("### HỢP ĐỒNG ĐẦU RA") == 1
-    assert (
-        "error_type, solution_index, from_order, to_order, reason, suggestion, "
-        "semantic_role, certificate_disposition, role_evidence, status"
-    ) in user_prompt
-    assert user_prompt.count("### NGỮ CẢNH CÂU HỎI") == 1
-    assert "### CONTEXT REQUIREMENTS" not in user_prompt
-    assert "verification_checks" not in user_prompt
-    assert "verification_payload" not in user_prompt
-    assert "code_analysis_reviews" not in user_prompt
-    assert user_prompt.count("### LỜI GIẢI THEO THỨ TỰ") == 1
-    assert user_prompt.count("### RÀNG BUỘC CUỐI") == 1
-    assert "KẾT LUẬN TỐT" not in user_prompt
-    assert "KẾT LUẬN SAI" not in user_prompt
-    assert '"from_order":null' in user_prompt
-    assert '"to_order":0' in user_prompt
-    assert '"bieu_thuc_sau":"Suy ra x = 2."' in user_prompt
-    assert '"code_analysis":' not in user_prompt
-    assert '"mandatory_code_issue":' not in user_prompt
-    assert '"code_alerts":' not in user_prompt
-    assert "Không trả `missing_major_step`" in user_prompt
-    assert "operation count" in user_prompt
-    assert "các lỗi này không thuộc Correctness Judge" in user_prompt
-    assert "không tự tạo cặp order, không bỏ qua state ở giữa" in user_prompt
-    assert "Không tự xây dựng lại dependency" not in user_prompt
-    assert "source_path phải trỏ đúng block" not in user_prompt
+def test_judge_prompt_contains_original_solution_directly():
+    messages = build_direct_correctness_messages(generated_question())
+    prompt = messages[-1]["content"]
+    assert "trách nhiệm kiểm tra tính đúng đắn" in messages[0]["content"]
+    assert "Suy ra x = 2." in prompt
+    assert "transition_id" not in prompt
+    assert prompt.count("### TIÊU CHÍ VÀ YÊU CẦU KIỂM TRA") == 1
+    assert prompt.count("### ĐỀ BÀI VÀ LỜI GIẢI NGUYÊN VĂN") == 1
+    assert '"comments"' in prompt
+    assert '"solution_index"' in prompt
+    assert "Những vấn đề này thuộc kiểm tra quá trình và trình bày" in prompt
 
 
-def test_correctness_prompt_exposes_only_reduced_hard_invalid_analysis():
-    transition_payload = {
-        "stages": [{
-            "solution_index": 0,
-            "from_order": None,
-            "to_order": 0,
-            "bieu_thuc_truoc": "2x^3 + 3 = 19",
-            "bieu_thuc_sau": "2x^3 = 18",
-            "code_analysis": {
-                "status": "verified_invalid",
-                "strength": "hard",
-                "transition_type": "equation_transformation",
-                "issue_type": "invalid_equivalence",
-                "reason": "Hai vế không tương đương.",
-                "operation_count": 1,
-                "operation_types": ["subtract_same_value_both_sides"],
-                "total_operation_count": 1,
-                "failing_pair_index": 1,
-                "failing_before": "2x^3 + 3 = 19",
-                "failing_after": "2x^3 = 18",
-            },
-        }]
-    }
-    user_prompt = build_generated_question_judge_messages(
-        generated_question(),
-        load_text(CRITERIA_PATH),
-        {"states": []},
-        transition_payload,
-    )[-1]["content"]
-
-    stage_text = user_prompt.split("### LỜI GIẢI THEO THỨ TỰ\n", 1)[1].split(
-        "\n\n### RÀNG BUỘC CUỐI", 1
-    )[0]
-    stage = json.loads(stage_text)["stages"][0]
-    assert stage["code_analysis"]["status"] == "verified_invalid"
-    assert stage["code_analysis"]["strength"] == "hard"
-    assert "claim_role_verification" not in stage
-    assert "operation_count" not in stage["code_analysis"]
-    assert "operation_types" not in stage["code_analysis"]
-    assert "total_operation_count" not in stage["code_analysis"]
 
 
-def test_judge_criteria_delegates_transition_mechanics_to_code_analysis():
-    criteria = load_text(CRITERIA_PATH)
-
-    assert "`verified_invalid + hard`" in criteria
-    assert "không phải verdict" in criteria
-    assert "Correctness Judge phải đọc nguyên văn toàn bộ state" in criteria
-    assert "Chỉ được bác bỏ cảnh báo khi có bằng chứng rõ ràng" in criteria
-    assert "Nếu không có bằng chứng rõ ràng" in criteria
-    assert "code_analysis_reviews" not in criteria
-    assert "phải coi đây là lỗi chắc chắn" not in criteria
-    assert "Trước khi chọn trạng thái, bắt buộc tự kiểm chứng độc lập" in criteria
-    assert "Tính lại từng phép tính số học" in criteria
-    assert "Không báo `missing_major_step`" in criteria
-    assert "Không dùng `operation_count`" in criteria
-    assert "Nếu một biểu thức hoặc trạng thái trung gian đã xuất hiện nguyên văn" in criteria
-    assert "điều kiện xác định, mất hoặc sinh nghiệm" in criteria
-    assert "phép tính số học, dấu, hệ số" in criteria
-    assert "Context bắt buộc đã được Builder và code xử lý" in criteria
-    assert "Không đánh giá answerSpec, expected, options, hints hoặc metadata" in criteria
-    assert "Không tự phát hiện hình, bảng, đồ thị" in criteria
 
 
 def test_presentation_criteria_does_not_require_a_separate_conclusion():
-    criteria = load_text(PROCESS_PRESENTATION_CRITERIA_PATH)
+    criteria = PROCESS_PRESENTATION_CRITERIA
 
-    assert "Không báo lỗi chỉ vì solution không có câu kết luận riêng" in criteria
-    assert "không được yêu cầu lặp lại thành câu kết luận" in criteria
+    assert "Không báo lỗi chỉ vì thiếu một câu kết luận riêng" in criteria
     assert "thiếu kết luận;" not in criteria
-    assert "Với `missing_major_step`" in criteria
-    assert "từ 2 phép biến đổi trở lên" in criteria
-    assert "chỉ nêu một phần các phép biến đổi cần thiết" in criteria
-    assert "phải nêu chính xác suy luận nào bị thiếu" in criteria
-    assert "thiếu công thức tổng quát" in criteria
-    assert "Không bắt buộc mỗi bước nằm ở content block hay dòng riêng" in criteria
+    assert "Đọc toàn bộ solution theo thứ tự" in criteria
+    assert "Không tự xác minh hay phán quyết đúng sai toán học" in criteria
+    assert "phép tính con" in criteria
+    assert "Không báo lỗi nếu chỉ thiếu phép tính con" in criteria
+    assert "Mỗi comment phải có `solution_index`" in criteria
+    assert "Không kết luận toàn bộ lời giải tốt hay xấu" in criteria
 
 
 def test_one_operation_benchmark_oracle_marks_condensed_cases_bad():
