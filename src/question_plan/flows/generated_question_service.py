@@ -8,6 +8,7 @@ the LLM solution-anchor resolver.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -40,7 +41,6 @@ from ..logic.generated_question_schema import (
     validate_generated_question_object,
     validate_input_record,
 )
-from ..logic.generated_question_spelling import check_spelling_and_wording, extract_text_nodes_for_spelling
 from ..logic.solution_anchor_resolver import compact_generated_question_for_solution_anchor, resolve_solution_anchor_consistency
 
 
@@ -141,7 +141,7 @@ def default_config() -> AppConfig:
 
 
 def clamp_loop_count(value: int) -> int:
-    return max(1, min(int(value or 1), 3))
+    return max(1, min(int(value or 1), 2))
 
 
 def has_bad_issue(issues: list[dict[str, Any]]) -> bool:
@@ -197,7 +197,7 @@ def canonical_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def compact_issue(issue: dict[str, Any]) -> dict[str, Any]:
-    return {
+    compact = {
         "severity": issue.get("severity"),
         "category": issue.get("category"),
         "location": issue.get("location"),
@@ -205,6 +205,9 @@ def compact_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "suggestion": issue.get("suggestion"),
         "repair_intent": issue.get("repair_intent"),
     }
+    if issue.get("disposition"):
+        compact["disposition"] = issue.get("disposition")
+    return compact
 
 
 def compact_solution_anchor_result(anchor: dict[str, Any]) -> dict[str, Any]:
@@ -352,11 +355,20 @@ def merge_anchor_result(
             generated_question=generated_question,
             index=index,
         )
+    resolved_issues = [
+        {
+            **issue,
+            "disposition": "blocking",
+        }
+        if anchor_result.get("resolver_status") == "resolved" and isinstance(issue, dict)
+        else issue
+        for issue in anchor_result.get("issues") or []
+    ]
     merged = normalize_generated_question_result(
         {
             "id": base_result.get("id"),
             "is_good": base_result.get("is_good", True),
-            "issues": canonical_issues([*(base_result.get("issues") or []), *(anchor_result.get("issues") or [])]),
+            "issues": canonical_issues([*(base_result.get("issues") or []), *resolved_issues]),
         },
         strict_mode=strict_mode,
         generated_question=generated_question,
@@ -365,7 +377,7 @@ def merge_anchor_result(
     for key in JUDGE_ROUTING_FIELDS:
         if key in base_result:
             merged[key] = base_result[key]
-    merged["solution_anchor_result"] = anchor_result
+    merged["solution_anchor_result"] = {**anchor_result, "issues": resolved_issues}
     return merged
 
 
@@ -377,18 +389,19 @@ def solution_quality_gate_issues(result: dict[str, Any]) -> list[dict[str, Any]]
         for issue in result.get("issues") or []
         if isinstance(issue, dict)
         and issue.get("category") == "solution_quality"
-        and issue.get("repair_intent") in {"clean_solution_reasoning", "needs_manual_review"}
+        and issue.get("repair_intent") in {
+            "fix_solution_correctness",
+            "fix_solution_process",
+            "needs_manual_review",
+        }
     ]
 
 
 def select_solution_quality_gate_issue(result: dict[str, Any]) -> dict[str, Any] | None:
-    """Prefer a manual solution blocker over a presentation-only cleanup."""
+    """Return the final reviewed solution blocker in aggregate order."""
 
     issues = solution_quality_gate_issues(result)
-    return next(
-        (issue for issue in issues if issue.get("repair_intent") == "needs_manual_review"),
-        next((issue for issue in issues if issue.get("repair_intent") == "clean_solution_reasoning"), None),
-    )
+    return issues[0] if issues else None
 
 
 def select_pre_resolver_blocker(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -424,71 +437,126 @@ def resolver_gate_open(
     )
 
 
-def text_node_map(generated_question: dict[str, Any]) -> dict[str, str]:
-    return {
-        str(node.get("path") or ""): str(node.get("text") or "")
-        for node in extract_text_nodes_for_spelling(generated_question)
-        if str(node.get("path") or "")
-    }
+REPAIRABLE_INTENTS = {
+    "fix_solution_correctness",
+    "fix_solution_process",
+    "align_fields_to_solution",
+    "align_hint_to_solution",
+}
 
 
-def changed_text_paths(original: dict[str, Any], repaired: dict[str, Any]) -> set[str]:
-    before, after = text_node_map(original), text_node_map(repaired)
-    return {path for path, text in after.items() if before.get(path) != text}
+def issue_has_missing_context(issue: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(issue.get(field) or "").lower()
+        for field in ("reason", "suggestion")
+    )
+    context_terms = ("dữ liệu", "context", "hình", "ảnh", "bảng", "biểu đồ")
+    missing_terms = (
+        "thiếu",
+        "không có",
+        "không được cung cấp",
+        "chưa cung cấp",
+        "không truy cập được",
+        "missing",
+        "unavailable",
+    )
+    return any(term in text for term in context_terms) and any(term in text for term in missing_terms)
 
 
-def validate_repaired_text(
-    original: dict[str, Any],
-    repair_result: dict[str, Any],
-    *,
-    config: AppConfig,
-    client: LLMClient,
-    debug: bool,
-) -> dict[str, Any]:
-    candidate = repair_result.get("new_generated_question")
-    if repair_result.get("repair_status") != "repaired" or not isinstance(candidate, dict):
-        return repair_result
-    changed_paths = changed_text_paths(original, candidate)
-    if not changed_paths:
-        return repair_result
-    spelling = check_spelling_and_wording(candidate, config=config, client=client, debug=debug)
-    generated_text_issues = [
-        issue for issue in spelling.get("issues") or []
-        if str(issue.get("location") or "") in changed_paths
-    ]
-    if not generated_text_issues:
-        return repair_result
-    return {
-        **repair_result,
-        "repair_status": "failed",
-        "failed_reason": ["Text do repair sinh ra không đạt spelling/render-safety."],
-        "suggestions": ["Review scoped patch vừa sinh; giữ nguyên math/LaTeX và sửa wording."],
-        "new_generated_question": None,
-    }
+def is_repairable_final_issue(issue: Any) -> bool:
+    return (
+        isinstance(issue, dict)
+        and issue.get("disposition") == "blocking"
+        and issue.get("severity") == "bad"
+        and issue.get("repair_intent") in REPAIRABLE_INTENTS
+        and issue.get("category") != "runtime"
+        and not issue_has_missing_context(issue)
+    )
+
+
+def _solution_index(issue: dict[str, Any]) -> int | None:
+    match = re.match(r"^/solutions/(\d+)(?:/|$)", str(issue.get("location") or ""))
+    return int(match.group(1)) if match else None
+
+
+def allowed_paths_for_issue(
+    generated_question: dict[str, Any],
+    check_result: dict[str, Any],
+    issue: dict[str, Any],
+) -> list[str]:
+    intent = str(issue.get("repair_intent") or "")
+    if intent in {"fix_solution_correctness", "fix_solution_process"}:
+        solution_index = _solution_index(issue)
+        solutions = generated_question.get("solutions")
+        if solution_index is None or not isinstance(solutions, list) or solution_index >= len(solutions):
+            return []
+        solution = solutions[solution_index]
+        content = solution.get("solutionContent") if isinstance(solution, dict) else None
+        if not isinstance(content, list):
+            return []
+        return [
+            f"/solutions/{solution_index}/solutionContent/{content_index}/text"
+            for content_index, block in enumerate(content)
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+
+    anchor = check_result.get("solution_anchor_result")
+    anchor = anchor if isinstance(anchor, dict) else {}
+    if intent == "align_fields_to_solution":
+        return [
+            str(fix.get("path") or "")
+            for fix in anchor.get("fields_to_fix") or []
+            if isinstance(fix, dict) and str(fix.get("path") or "").startswith("/questionItems/")
+        ]
+
+    if intent == "align_hint_to_solution":
+        location = str(issue.get("location") or "")
+        paths: list[str] = []
+        for item_index, item in enumerate(generated_question.get("questionItems") or []):
+            if not isinstance(item, dict):
+                continue
+            for hint_index, hint in enumerate(item.get("hints") or []):
+                if not isinstance(hint, dict):
+                    continue
+                hint_root = f"/questionItems/{item_index}/hints/{hint_index}"
+                if location and not (location == hint_root or location.startswith(hint_root + "/")):
+                    continue
+                for content_index, block in enumerate(hint.get("content") or []):
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        paths.append(f"{hint_root}/content/{content_index}/text")
+        return paths
+    return []
 
 
 def select_repair_issue(check_result: dict[str, Any]) -> dict[str, Any] | None:
-    blocker = select_pre_resolver_blocker(check_result)
-    if blocker:
-        return blocker
-    issues = [issue for issue in check_result.get("issues") or [] if isinstance(issue, dict)]
-    ordered = sorted(issues, key=issue_sort_key)
-    repairable = {
-        "align_fields_to_solution",
-        "align_hint_to_solution",
-        "clean_solution_reasoning",
-        "fix_schema",
-    }
-    return next(
-        (issue for issue in ordered if issue.get("repair_intent") in repairable),
-        ordered[0] if ordered else None,
+    if int(check_result.get("non_canonical_count") or 0) or int(check_result.get("runtime_count") or 0):
+        return None
+    if any(
+        isinstance(issue, dict) and issue.get("category") == "runtime"
+        for issue in check_result.get("issues") or []
+    ):
+        return None
+    first_blocking = next(
+        (
+            issue
+            for issue in check_result.get("issues") or []
+            if isinstance(issue, dict)
+            and issue.get("disposition") == "blocking"
+            and issue.get("severity") == "bad"
+        ),
+        None,
     )
+    return first_blocking if is_repairable_final_issue(first_blocking) else None
 
 
 def compact_selected_issue(issue: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(issue, dict):
         return None
     return {
+        "severity": issue.get("severity"),
+        "disposition": issue.get("disposition"),
         "category": issue.get("category"),
         "location": issue.get("location"),
         "repair_intent": issue.get("repair_intent"),
@@ -504,85 +572,70 @@ def repair_once(
     index: int,
     debug: bool,
 ) -> dict[str, Any]:
-    solution_issue = select_solution_quality_gate_issue(check_result)
-    runtime_blocker = next(
-        (
-            issue
-            for issue in check_result.get("issues") or []
-            if isinstance(issue, dict) and issue.get("category") == "runtime"
-        ),
-        None,
-    )
-    if runtime_blocker:
-        return {
-            "repair_status": "needs_manual_review",
-            "failed_reason": ["Chưa xác minh được chất lượng solution do lỗi runtime/LLM."],
-            "suggestions": ["Chạy lại Solution Quality Judge hoặc review thủ công trước khi repair."],
-            "new_generated_question": None,
-            "patches": [],
-            "selected_issue": compact_selected_issue(runtime_blocker),
-        }
-    if solution_issue and solution_issue.get("repair_intent") != "clean_solution_reasoning":
-        return {
-            "repair_status": "needs_manual_review",
-            "failed_reason": ["Solution có vấn đề nội dung cần review trước khi căn chỉnh các field khác."],
-            "suggestions": ["Review thủ công solution; chưa sửa answerSpec/options/hints."],
-            "new_generated_question": None,
-            "patches": [],
-            "selected_issue": compact_selected_issue(solution_issue),
-        }
-
-    anchor = {} if solution_issue else check_result.get("solution_anchor_result")
-    anchor = anchor if isinstance(anchor, dict) else {}
-    if anchor.get("resolver_status") == "needs_manual_review":
-        selected = select_repair_issue(check_result)
-        return {
-            "repair_status": "needs_manual_review",
-            "failed_reason": ["Solution chưa đủ rõ để tự động căn chỉnh đáp án."],
-            "suggestions": ["Review thủ công solution và answerSpec/options."],
-            "new_generated_question": None,
-            "patches": [],
-            "selected_issue": compact_selected_issue(selected),
-        }
-
-    fixes = anchor.get("fields_to_fix") if isinstance(anchor.get("fields_to_fix"), list) else []
-    has_align_intent = any(
-        isinstance(issue, dict) and issue.get("repair_intent") == "align_fields_to_solution"
-        for issue in check_result.get("issues") or []
-    )
-    if anchor.get("resolver_status") == "resolved" and fixes and has_align_intent:
-        selected = next(
-            (
-                issue for issue in check_result.get("issues") or []
-                if isinstance(issue, dict) and issue.get("repair_intent") == "align_fields_to_solution"
-            ),
+    issue = select_repair_issue(check_result)
+    if not issue:
+        first_issue = next(
+            (item for item in check_result.get("issues") or [] if isinstance(item, dict)),
             None,
         )
+        return {
+            "repair_status": "needs_manual_review",
+            "failed_reason": ["Không có blocking issue đủ điều kiện Repair tự động."],
+            "suggestions": ["Review thủ công issue hoặc chạy lại stage bị non-canonical/runtime."],
+            "new_generated_question": None,
+            "patches": [],
+            "selected_issue": compact_selected_issue(first_issue),
+        }
+
+    allowed_paths = allowed_paths_for_issue(generated_question, check_result, issue)
+    if not allowed_paths:
+        return {
+            "repair_status": "needs_manual_review",
+            "failed_reason": ["Issue thiếu context hoặc không có allowed_paths hợp lệ."],
+            "suggestions": ["Review thủ công; không mở rộng phạm vi patch."],
+            "new_generated_question": None,
+            "patches": [],
+            "selected_issue": compact_selected_issue(issue),
+        }
+
+    anchor = check_result.get("solution_anchor_result")
+    anchor = anchor if isinstance(anchor, dict) else {}
+    if issue.get("repair_intent") == "align_fields_to_solution":
+        fixes = anchor.get("fields_to_fix") if isinstance(anchor.get("fields_to_fix"), list) else []
+        if anchor.get("resolver_status") != "resolved" or not fixes:
+            return {
+                "repair_status": "needs_manual_review",
+                "failed_reason": ["Resolver chưa xác nhận solution đúng hoặc không có field fix hợp lệ."],
+                "suggestions": ["Không sửa answerSpec trước khi solution được xác minh."],
+                "new_generated_question": None,
+                "patches": [],
+                "selected_issue": compact_selected_issue(issue),
+            }
         patches = [
-            {"op": "replace", "path": fix["path"], "value": fix["value"]}
+            {
+                "op": "replace",
+                "path": fix["path"],
+                "value": fix["value"],
+                "reason": str(fix.get("reason") or issue.get("reason") or "Căn chỉnh answerSpec với solution đã xác minh."),
+            }
             for fix in fixes
-            if isinstance(fix, dict) and fix.get("path") and "value" in fix
+            if isinstance(fix, dict) and fix.get("path") in allowed_paths and "value" in fix
         ]
         result = normalize_scoped_repair_result(
             {"repair_status": "repaired", "failed_reason": [], "suggestions": [], "patches": patches},
             generated_question=generated_question,
             index=index,
+            repair_intent="align_fields_to_solution",
+            allowed_paths=allowed_paths,
         )
-        result["selected_issue"] = compact_selected_issue(selected)
+        result["selected_issue"] = compact_selected_issue(issue)
         return result
 
-    issue = solution_issue or select_repair_issue(check_result)
-    if not issue:
-        return {"repair_status": "failed", "new_generated_question": None, "patches": []}
-    if issue.get("repair_intent") not in {
-        "align_hint_to_solution",
-        "clean_solution_reasoning",
-        "fix_schema",
-    }:
+    if issue.get("repair_intent") == "align_hint_to_solution" and anchor.get("resolver_status") != "resolved":
         return {
             "repair_status": "needs_manual_review",
-            "failed_reason": ["Issue không thể sửa an toàn bằng scoped patch."],
-            "suggestions": ["Review thủ công; full-object repair đã bị vô hiệu hóa."],
+            "failed_reason": ["Resolver chưa xác nhận solution đúng nên chưa được sửa hint."],
+            "suggestions": ["Review solution trước khi căn chỉnh hint."],
             "new_generated_question": None,
             "patches": [],
             "selected_issue": compact_selected_issue(issue),
@@ -607,6 +660,7 @@ def repair_once(
         issue,
         config,
         client,
+        allowed_paths=allowed_paths,
         index=index,
         debug=debug,
     )
@@ -625,6 +679,40 @@ def merge_repair_result(base: dict[str, Any], repair: dict[str, Any], loop_count
     result["repair_loop_count"] = loop_count
     result["repair_stop_reason"] = stop_reason
     return result
+
+
+def repair_issue_identity(issue: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(issue.get("category") or ""),
+        str(issue.get("location") or ""),
+        str(issue.get("repair_intent") or ""),
+    )
+
+
+def significant_issue_identities(result: dict[str, Any]) -> set[tuple[str, str, str]]:
+    return {
+        repair_issue_identity(issue)
+        for issue in result.get("issues") or []
+        if isinstance(issue, dict) and issue.get("severity") in {"bad", "needs_review"}
+    }
+
+
+def manual_repair_stop(
+    generated_question: dict[str, Any],
+    issue: dict[str, Any] | None,
+    reason: str,
+    *,
+    patches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": generated_question.get("id") or generated_question.get("_id"),
+        "repair_status": "needs_manual_review",
+        "failed_reason": [reason],
+        "suggestions": ["Giữ nguyên object gốc và review thủ công issue còn lại."],
+        "new_generated_question": None,
+        "patches": patches or [],
+        "selected_issue": compact_selected_issue(issue),
+    }
 
 
 def maybe_repair_generated_question(
@@ -646,17 +734,30 @@ def maybe_repair_generated_question(
     config = config or default_config()
     client = client or LLMClient(config)
     current_question, current_result = generated_question, check_result
-    last_success: dict[str, Any] | None = None
+    accepted_patches: list[dict[str, Any]] = []
     last_result: dict[str, Any] | None = None
     stop_reason = "max_loop_reached"
     loop_count = 0
 
     while loop_count < clamp_loop_count(max_loop) and not current_result.get("is_good"):
-        last_result = validate_repaired_text(
+        target_issue = select_repair_issue(current_result)
+        if not target_issue:
+            last_result = manual_repair_stop(
+                generated_question,
+                next((issue for issue in current_result.get("issues") or [] if isinstance(issue, dict)), None),
+                "Issue đầu tiên không đủ điều kiện Repair tự động.",
+                patches=accepted_patches,
+            )
+            stop_reason = "ineligible_issue"
+            break
+        target_identity = repair_issue_identity(target_issue)
+        baseline_identities = significant_issue_identities(current_result) - {target_identity}
+        last_result = repair_once(
             current_question,
-            repair_once(current_question, current_result, config=config, client=client, index=index, debug=debug),
+            current_result,
             config=config,
             client=client,
+            index=index,
             debug=debug,
         )
         loop_count += 1
@@ -664,26 +765,72 @@ def maybe_repair_generated_question(
         if last_result.get("repair_status") != "repaired" or not isinstance(candidate, dict):
             stop_reason = str(last_result.get("repair_status") or "repair_failed")
             break
-        last_success = last_result
-        current_question = candidate
-        current_result = evaluate_generated_question_object(
-            current_question,
+
+        structural = validate_generated_question_object(candidate, index)
+        if has_bad_issue(structural.get("issues") or []):
+            last_result = manual_repair_stop(
+                generated_question,
+                target_issue,
+                "Patch tạo generated question không hợp lệ về cấu trúc.",
+                patches=accepted_patches,
+            )
+            stop_reason = "structural_regression"
+            break
+
+        rechecked = evaluate_generated_question_object(
+            candidate,
             strict_mode=strict_mode,
             config=config,
             client=client,
             debug=debug,
             index=index,
             auto_repair=False,
-            max_loop=3,
+            max_loop=2,
         )
-        if current_result.get("is_good"):
-            stop_reason = "recheck_good"
+        rechecked_identities = significant_issue_identities(rechecked)
+        if target_identity in rechecked_identities:
+            last_result = manual_repair_stop(
+                generated_question,
+                target_issue,
+                "Issue mục tiêu vẫn xuất hiện sau khi rejudge.",
+                patches=accepted_patches,
+            )
+            stop_reason = "same_issue_reappeared"
             break
-        if loop_count >= clamp_loop_count(max_loop):
+        new_identities = rechecked_identities - baseline_identities
+        if new_identities:
+            last_result = manual_repair_stop(
+                generated_question,
+                target_issue,
+                "Patch làm phát sinh lỗi bad/needs_review mới sau khi rejudge.",
+                patches=accepted_patches,
+            )
+            stop_reason = "new_issue_after_rejudge"
             break
 
-    chosen = last_success if last_result and last_result.get("repair_status") != "repaired" and last_success else last_result
-    return merge_repair_result(check_result, chosen or {}, loop_count, stop_reason)
+        accepted_patches.extend(last_result.get("patches") or [])
+        current_question = candidate
+        current_result = rechecked
+        if current_result.get("is_good"):
+            last_result = {
+                **last_result,
+                "new_generated_question": current_question,
+                "patches": accepted_patches,
+            }
+            stop_reason = "recheck_good"
+            break
+
+    if current_result.get("is_good") and last_result and last_result.get("repair_status") == "repaired":
+        return merge_repair_result(check_result, last_result, loop_count, stop_reason)
+    if last_result and last_result.get("repair_status") == "repaired":
+        last_result = manual_repair_stop(
+            generated_question,
+            select_repair_issue(current_result),
+            "Đã đạt giới hạn hai vòng nhưng object vẫn còn blocking issue.",
+            patches=accepted_patches,
+        )
+        stop_reason = "max_loop_reached"
+    return merge_repair_result(check_result, last_result or {}, loop_count, stop_reason)
 
 
 def evaluate_generated_question_object(
@@ -695,7 +842,7 @@ def evaluate_generated_question_object(
     debug: bool = False,
     index: int = 0,
     auto_repair: bool = False,
-    max_loop: int = 1,
+    max_loop: int = 2,
 ) -> dict[str, Any]:
     try:
         schema_result = validate_generated_question_object(generated_question, index)
@@ -828,7 +975,7 @@ def evaluate_generated_questions(
     debug: bool = False,
     progress_callback: GeneratedQuestionProgressCallback | None = None,
     auto_repair: bool = False,
-    max_loop: int = 1,
+    max_loop: int = 2,
     workers: int = 1,
 ) -> dict[str, Any]:
     input_issues = validate_input_record(payload)

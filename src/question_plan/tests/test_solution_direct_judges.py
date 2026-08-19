@@ -532,6 +532,9 @@ def test_aggregate_prioritizes_blocking_correctness_over_earlier_process_issue()
         "Từ đề bài phải suy ra 2x^3 = 16, không phải 18."
     )
     assert result["issues"][0]["suggestion"] == "Sửa 18 thành 16."
+    assert result["issues"][0]["severity"] == "bad"
+    assert result["issues"][0]["disposition"] == "blocking"
+    assert result["issues"][0]["repair_intent"] == "fix_solution_correctness"
 
 
 def test_parse_json_output_repairs_common_local_model_json_syntax():

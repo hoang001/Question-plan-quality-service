@@ -186,11 +186,12 @@ def make_issue(
     error_snippet: str = "",
     required_context_paths: list[str] | None = None,
     repair_intent: str = "",
+    disposition: str = "",
 ) -> dict[str, Any]:
     normalized_category = category if category in CATEGORIES else "runtime"
     normalized_location = location_to_json_pointer(location)
     normalized_paths = required_context_paths or default_context_paths(normalized_category, normalized_location)
-    return {
+    result = {
         "severity": severity if severity in SEVERITIES else "needs_review",
         "category": normalized_category,
         "location": normalized_location,
@@ -200,6 +201,9 @@ def make_issue(
         "required_context_paths": normalized_paths,
         "repair_intent": repair_intent or default_repair_intent(normalized_category, reason, normalized_location),
     }
+    if disposition in {"blocking", "advisory", "rejected"}:
+        result["disposition"] = disposition
+    return result
 
 
 def runtime_issue(
@@ -279,6 +283,7 @@ def normalize_issue(value: Any, index: int) -> dict[str, Any]:
         error_snippet=str(issue.get("error_snippet") or "").strip(),
         required_context_paths=required_context_paths,
         repair_intent=str(issue.get("repair_intent") or "").strip(),
+        disposition=str(issue.get("disposition") or "").strip(),
     )
 
 

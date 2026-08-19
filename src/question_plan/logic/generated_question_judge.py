@@ -866,15 +866,42 @@ def aggregate_reviewed_comments(
             ),
         )
         advisory = selected["disposition"] == "advisory"
+        context_text = " ".join(
+            str(selected.get(field) or "").lower()
+            for field in ("evidence", "reason", "suggestion")
+        )
+        missing_context = any(
+            marker in context_text
+            for marker in (
+                "thiếu dữ liệu",
+                "thiếu hình",
+                "không có hình",
+                "không có bảng",
+                "chưa cung cấp hình",
+                "chưa cung cấp bảng",
+                "missing image",
+                "missing context",
+            )
+        )
+        repair_intent = (
+            "needs_manual_review"
+            if missing_context
+            else "clean_solution_reasoning"
+            if advisory
+            else "fix_solution_correctness"
+            if selected["source"] == "correctness"
+            else "fix_solution_process"
+        )
         payload = {
             "is_good": False,
             "issues": [{
-                "severity": "warning" if advisory else "needs_review",
+                "severity": "warning" if advisory else "bad",
                 "category": "solution_quality",
                 "location": f"/solutions/{int(selected['solution_index'])}",
                 "reason": selected["reason"],
                 "suggestion": selected["suggestion"],
-                "repair_intent": "clean_solution_reasoning" if advisory else "needs_manual_review",
+                "repair_intent": repair_intent,
+                "disposition": selected["disposition"],
             }],
         }
     return normalize_generated_question_result(

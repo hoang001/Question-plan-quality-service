@@ -7,11 +7,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ..infra.config import AppConfig, generated_question_fast_model, generated_question_reasoning_model
+from ..infra.config import AppConfig, generated_question_reasoning_model
 from ..infra.debug import debug_llm_messages
 from ..infra.llm_client import LLMClient
 from ..shared.utils import parse_json_output
 from ..schemas.generated_question_contracts import (
+    RepairPatchOutput,
     ScopedRepairOutput,
     contract_schema_text,
     validation_error_text,
@@ -89,6 +90,7 @@ def build_scoped_repair_context(
     issue: dict[str, Any],
     check_result: dict[str, Any],
     *,
+    allowed_paths: list[str] | None = None,
     max_context_chars: int = 12000,
 ) -> dict[str, Any]:
     location = location_to_json_pointer(str(issue.get("location") or ""))
@@ -116,48 +118,40 @@ def build_scoped_repair_context(
         "issue": normalized_issue,
         "check_result": compact_check_result_for_repair(check_result),
         "extracted_context": context,
+        "allowed_paths": allowed_paths or [],
     }
     if len(json.dumps(payload, ensure_ascii=False)) > max_context_chars:
         return {"context_ok": False, "reason": "Scoped repair context vượt giới hạn an toàn."}
     return {"context_ok": True, "payload": payload}
 
 
-GENERATED_QUESTION_REPAIR_RULES = """# Generated Question Repair Rules
+GENERATED_QUESTION_REPAIR_RULES = """# Quy tắc Repair
 
-- Chỉ sửa generated question object được cung cấp.
-- Không dùng question_plan, raw question, raw answer, PDF, OCR hoặc dữ liệu ngoài.
-- Chỉ dùng scoped patch; không full-object fallback và không tạo lời giải mới.
-- Giữ nguyên id/_id; không sửa difficulty/bloom hoặc thêm metadata report vào object.
-- `align_fields_to_solution` chỉ sửa answerSpec theo `fields_to_fix` đã được resolver trả và code xác thực. Không sửa solution hoặc nội dung option đã tồn tại.
-- `align_hint_to_solution` chỉ sửa hint khi resolver đã resolved và issue xác nhận hint mâu thuẫn trực tiếp với solution.
-- `clean_solution_reasoning` chỉ làm sạch wording thử-sai/tự vấn trong solution, giữ nguyên kết luận cuối theo `solution_anchor_result.final_answer`; không đổi answerSpec/options nếu chúng đã khớp.
-- Nếu resolver là `needs_manual_review`, không đoán đáp án và không repair answerSpec/options/hints/solution.
-- Nếu scoped context/path không đủ an toàn, trả `needs_manual_review`.
-- Patch phải là JSON Patch áp dụng trên generated question gốc và chỉ chạm đúng phạm vi issue.
-- Không tự giải lại bài từ instruction/stem để quyết định đáp án.
-- Chuỗi diễn giải phải viết bằng tiếng Việt có dấu, trừ tên field/id/path/code/LaTeX."""
+- Chỉ trả JSON Patch, không trả toàn bộ generated question và không trả verdict/status.
+- Chỉ dùng `op=replace`; mỗi patch phải có `path`, `value`, `reason`.
+- `path` bắt buộc thuộc `allowed_paths`. Không tạo, xóa hoặc đổi thứ tự field/block.
+- `fix_solution_correctness`: sửa lỗi toán học trong solution theo issue đã được Review xác nhận.
+- `fix_solution_process`: chỉ bổ sung hoặc làm rõ solution, không đổi kết quả toán.
+- `align_hint_to_solution`: chỉ sửa hint được chỉ định.
+- Không sửa ID, instruction, stem, interaction, option, metadata hoặc field ngoài phạm vi.
+- Không bịa dữ kiện, hình ảnh, bảng hoặc giả thiết còn thiếu.
+- `reason` phải ngắn gọn, bằng tiếng Việt và giải thích đúng thay đổi của patch."""
 
 def build_generated_question_scoped_repair_messages(
     scoped_payload: dict[str, Any],
 ) -> list[dict[str, str]]:
-    output_schema_text = contract_schema_text(ScopedRepairOutput)
+    output_schema_text = contract_schema_text(RepairPatchOutput)
     return [
         {
             "role": "system",
             "content": (
-                "Bạn sửa một issue cụ thể bằng JSON Patch trên generated question. Chỉ scoped repair, không full rewrite, "
-                "không tự giải bài và không tạo đáp án mới. Final answer đã viết trong solution là mốc phải giữ nguyên. "
-                "Chỉ trả JSON hợp lệ; reason/suggestion phải là tiếng Việt có dấu."
+                "Bạn sửa đúng một issue đã được Review xác nhận bằng JSON Patch. "
+                "Chỉ trả JSON hợp lệ theo schema, không viết nội dung ngoài JSON."
             ),
         },
         {
             "role": "user",
             "content": (
-                "Áp dụng đúng repair_intent:\n"
-                "- align_hint_to_solution: chỉ sửa hint mâu thuẫn với solution resolved.\n"
-                "- clean_solution_reasoning: bỏ thử-sai/tự vấn/đoạn nháp nhưng giữ nguyên final answer; không tự giải lại.\n"
-                "- fix_schema: chỉ patch cấu trúc/render nhỏ và an toàn.\n"
-                "Nếu không đủ context hoặc không có patch an toàn, trả needs_manual_review.\n\n"
                 f"QUY TẮC SỬA:\n{GENERATED_QUESTION_REPAIR_RULES}\n\n"
                 f"LƯỢC ĐỒ ĐẦU RA:\n{output_schema_text}\n\n"
                 f"DỮ LIỆU TRONG PHẠM VI:\n{json.dumps(scoped_payload, ensure_ascii=False, indent=2)}"
@@ -183,6 +177,7 @@ def normalize_scoped_repair_result(
     generated_question: dict[str, Any],
     index: int = 0,
     repair_intent: str = "",
+    allowed_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     try:
         parsed = ScopedRepairOutput.model_validate(parsed).model_dump()
@@ -214,15 +209,30 @@ def normalize_scoped_repair_result(
     for patch in patches:
         if not isinstance(patch, dict):
             return manual_review_result("Patch không phải JSON object.", generated_question, index)
-        if patch.get("op") not in {"replace", "add", "remove"}:
+        if patch.get("op") != "replace":
             return manual_review_result("Patch operation không hợp lệ.", generated_question, index)
-        if not is_safe_generated_question_patch_path(str(patch.get("path") or "")):
-            return manual_review_result("Patch path không an toàn.", generated_question, index)
         pointer = location_to_json_pointer(str(patch.get("path") or ""))
+        if allowed_paths is not None and pointer not in allowed_paths:
+            return manual_review_result("Patch path nằm ngoài allowed_paths.", generated_question, index)
+        if allowed_paths is None and not is_safe_generated_question_patch_path(pointer):
+            return manual_review_result("Patch path không an toàn.", generated_question, index)
         if repair_intent == "align_hint_to_solution" and "/hints/" not in f"{pointer}/":
             return manual_review_result("Patch align_hint_to_solution nằm ngoài hints.", generated_question, index)
-        if repair_intent == "clean_solution_reasoning" and not pointer.startswith("/solutions/"):
-            return manual_review_result("Patch clean_solution_reasoning nằm ngoài solutions.", generated_question, index)
+        if repair_intent in {"fix_solution_correctness", "fix_solution_process"} and not pointer.startswith("/solutions/"):
+            return manual_review_result("Patch sửa solution nằm ngoài solutions.", generated_question, index)
+        try:
+            current = get_by_json_pointer(generated_question, pointer)
+        except JsonPointerError as exc:
+            return manual_review_result(str(exc), generated_question, index)
+        replacement = patch.get("value")
+        if isinstance(current, bool):
+            same_type = isinstance(replacement, bool)
+        elif isinstance(current, (int, float)):
+            same_type = isinstance(replacement, (int, float)) and not isinstance(replacement, bool)
+        else:
+            same_type = isinstance(replacement, type(current))
+        if not same_type:
+            return manual_review_result("Patch value không cùng kiểu với giá trị hiện tại.", generated_question, index)
 
     try:
         candidate = apply_json_patch(generated_question, patches)
@@ -259,20 +269,24 @@ def repair_generated_question_scoped(
     config: AppConfig,
     client: LLMClient,
     *,
+    allowed_paths: list[str],
     index: int = 0,
     debug: bool = False,
 ) -> dict[str, Any]:
-    context = build_scoped_repair_context(generated_question, issue, check_result)
+    if not allowed_paths:
+        return manual_review_result("Issue không có allowed_paths an toàn.", generated_question, index)
+    context = build_scoped_repair_context(
+        generated_question,
+        issue,
+        check_result,
+        allowed_paths=allowed_paths,
+    )
     if not context.get("context_ok"):
         return manual_review_result(str(context.get("reason") or "Scoped context không an toàn."), generated_question, index)
     messages = build_generated_question_scoped_repair_messages(
         context["payload"],
     )
-    model = (
-        generated_question_fast_model(config)
-        if issue.get("repair_intent") == "fix_schema"
-        else generated_question_reasoning_model(config)
-    )
+    model = generated_question_reasoning_model(config)
     try:
         debug_llm_messages(
             step="generated_question_scoped_repair",
@@ -284,15 +298,38 @@ def repair_generated_question_scoped(
             model=model,
             messages=messages,
             temperature=0,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "generated_question_repair_patch",
+                    "strict": True,
+                    "schema": RepairPatchOutput.model_json_schema(),
+                },
+            },
+            max_tokens=2048,
         )
         parsed, ok, parse_error = parse_json_output(str(response.get("content") or ""))
         if not ok:
             return manual_review_result(parse_error or "Không parse được scoped repair output.", generated_question, index)
+        try:
+            patch_output = RepairPatchOutput.model_validate(parsed).model_dump()
+        except ValidationError as exc:
+            return manual_review_result(
+                "Repair patch không đúng contract: " + validation_error_text(exc),
+                generated_question,
+                index,
+            )
         return normalize_scoped_repair_result(
-            parsed,
+            {
+                "repair_status": "repaired",
+                "patches": patch_output["patches"],
+                "failed_reason": [],
+                "suggestions": [],
+            },
             generated_question=generated_question,
             index=index,
             repair_intent=str(issue.get("repair_intent") or ""),
+            allowed_paths=allowed_paths,
         )
     except Exception as exc:
         return manual_review_result(str(exc), generated_question, index)

@@ -156,9 +156,16 @@ class SolutionResolverOutput(ContractModel):
 
 
 class JsonPatch(ContractModel):
-    op: Literal["replace", "add", "remove"]
+    op: Literal["replace"]
     path: str
-    value: Any = None
+    value: Any
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class RepairPatchOutput(ContractModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    patches: list[JsonPatch] = Field(min_length=1)
 
 
 class ScopedRepairOutput(ContractModel):
