@@ -43,8 +43,8 @@ def test_direct_prompts_receive_original_solution_without_transitions():
         prompt = messages[-1]["content"]
         assert generated["solutions"][0]["solutionContent"][0]["text"] in prompt
         assert "transition_id" not in prompt
-        assert "bieu_thuc_truoc" not in prompt
-        assert "bieu_thuc_sau" not in prompt
+        assert "nội dung trước" not in prompt
+        assert "nội dung sau" not in prompt
 
     correctness_prompt = build_direct_correctness_messages(generated)[-1]["content"]
     assert "Kiểm tra solution từ đầu đến cuối" in correctness_prompt
