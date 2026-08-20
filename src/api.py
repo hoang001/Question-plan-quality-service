@@ -152,7 +152,11 @@ def evaluate_question_plans_api(
         raise HTTPException(status_code=500, detail=f"Lỗi khi đánh giá danh sách question_plan: {exc}") from exc
 
 
-@app.post("/evaluate-generated-questions")
+@app.post(
+    "/evaluate-generated-questions",
+    tags=["Generated Questions"],
+    summary="Đánh giá generated questions",
+)
 def evaluate_generated_questions_api(
     payload: Any = Body(
         ...,
@@ -164,8 +168,8 @@ def evaluate_generated_questions_api(
     ),
     strict_mode: bool = Query(default=True, description="Nếu true, needs_review/bad làm is_good=false."),
     debug: bool = Query(default=True, description="false trả compact output; true trả diagnostics an toàn."),
-    auto_repair: bool = Query(default=True, description="Bật repair tự động nếu lỗi sửa được an toàn."),
-    max_loop: int = Query(default=3, description="Số vòng repair/check tối đa, service clamp trong khoảng 1..3."),
+    auto_repair: bool = Query(default=False, description="Bật repair tự động nếu lỗi sửa được an toàn."),
+    max_loop: int = Query(default=2, ge=1, le=2, description="Số vòng repair/check tối đa."),
     workers: int = Query(default=2, ge=1, le=4, description="Số generated question xử lý song song; Gemma tối đa 4 call."),
     _: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
@@ -182,3 +186,42 @@ def evaluate_generated_questions_api(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi khi đánh giá generatedQuestions: {exc}") from exc
+
+
+@app.post(
+    "/repair-generated-questions",
+    tags=["Generated Questions"],
+    summary="Đánh giá và Repair generated questions",
+    description=(
+        "Chạy toàn bộ pipeline đánh giá, chỉ Repair blocking issue đủ điều kiện, "
+        "sau đó rejudge trước khi trả new_generated_question."
+    ),
+)
+def repair_generated_questions_api(
+    payload: Any = Body(
+        ...,
+        description=(
+            "Một generated question object, list generated question object, "
+            "hoặc wrapper có field generatedQuestions."
+        ),
+        examples=[GENERATED_QUESTION_OBJECT_EXAMPLE, [GENERATED_QUESTION_OBJECT_EXAMPLE]],
+    ),
+    strict_mode: bool = Query(default=True, description="Bật strict quality gate."),
+    debug: bool = Query(default=True, description="Hiển thị repair_status, patches và stop_reason."),
+    max_loop: int = Query(default=2, ge=1, le=2, description="Tối đa hai vòng Repair và rejudge."),
+    workers: int = Query(default=2, ge=1, le=4, description="Số generated question xử lý song song."),
+    _: None = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        return evaluate_generated_questions(
+            payload,
+            strict_mode=strict_mode,
+            debug=debug,
+            auto_repair=True,
+            max_loop=max_loop,
+            workers=workers,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi Repair generatedQuestions: {exc}") from exc
