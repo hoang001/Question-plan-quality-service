@@ -457,10 +457,18 @@ def test_resolver_legacy_fix_paths_remain_valid():
 
 def test_input_accepts_single_list_and_wrapper():
     question = generated_question()
+    source_record = {
+        "_id": "source-1",
+        "question": "Dữ liệu nguồn không thuộc phạm vi check solution.",
+        "question_plan": {"ignored": True},
+        "generatedQuestions": [question],
+    }
 
     assert normalize_generated_question_input(question) == [question]
     assert normalize_generated_question_input([question]) == [question]
     assert normalize_generated_question_input({"generatedQuestions": [question]}) == [question]
+    assert normalize_generated_question_input([source_record]) == [question]
+    assert normalize_generated_question_input([source_record, question]) == [question, question]
 
 
 def test_single_object_runs_judge_then_resolver_and_returns_compact_output():
