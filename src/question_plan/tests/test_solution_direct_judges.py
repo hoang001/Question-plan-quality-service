@@ -43,8 +43,8 @@ def test_direct_prompts_receive_original_solution_without_transitions():
         prompt = messages[-1]["content"]
         assert generated["solutions"][0]["solutionContent"][0]["text"] in prompt
         assert "transition_id" not in prompt
-        assert "bieu_thuc_truoc" not in prompt
-        assert "bieu_thuc_sau" not in prompt
+        assert "nội dung trước" not in prompt
+        assert "nội dung sau" not in prompt
 
     correctness_prompt = build_direct_correctness_messages(generated)[-1]["content"]
     assert "Kiểm tra solution từ đầu đến cuối" in correctness_prompt
@@ -532,6 +532,9 @@ def test_aggregate_prioritizes_blocking_correctness_over_earlier_process_issue()
         "Từ đề bài phải suy ra 2x^3 = 16, không phải 18."
     )
     assert result["issues"][0]["suggestion"] == "Sửa 18 thành 16."
+    assert result["issues"][0]["severity"] == "bad"
+    assert result["issues"][0]["disposition"] == "blocking"
+    assert result["issues"][0]["repair_intent"] == "fix_solution_correctness"
 
 
 def test_parse_json_output_repairs_common_local_model_json_syntax():

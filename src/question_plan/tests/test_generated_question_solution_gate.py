@@ -34,12 +34,13 @@ def generated_question() -> dict:
 
 def solution_issue(intent: str) -> dict:
     return {
-        "severity": "needs_review" if intent == "needs_manual_review" else "warning",
+        "severity": "bad" if intent == "needs_manual_review" else "warning",
         "category": "solution_quality",
         "location": "/solutions/0/solutionContent/0/text",
         "reason": "Solution cần xử lý trước.",
         "suggestion": "Xử lý solution trước.",
         "repair_intent": intent,
+        "disposition": "blocking" if intent == "needs_manual_review" else "advisory",
     }
 
 
@@ -372,7 +373,7 @@ def test_runtime_issue_blocks_resolver_and_repair(monkeypatch):
     assert result["repair_status"] == "needs_manual_review"
 
 
-def test_solution_cleanup_has_priority_over_alignment():
+def test_blocking_alignment_has_priority_over_advisory_cleanup():
     cleanup = solution_issue("clean_solution_reasoning")
     alignment = {
         "severity": "bad",
@@ -381,9 +382,10 @@ def test_solution_cleanup_has_priority_over_alignment():
         "reason": "answerSpec lệch solution.",
         "suggestion": "Căn answerSpec.",
         "repair_intent": "align_fields_to_solution",
+        "disposition": "blocking",
     }
 
-    assert service.select_repair_issue({"issues": [alignment, cleanup]}) == cleanup
+    assert service.select_repair_issue({"issues": [alignment, cleanup]}) == alignment
 
 
 def test_manual_solution_issue_is_not_auto_repaired():

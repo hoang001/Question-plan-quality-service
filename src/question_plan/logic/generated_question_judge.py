@@ -525,7 +525,7 @@ PROCESS_PRESENTATION_CRITERIA = """1. Đọc toàn bộ solution theo thứ tự
 
 2. Chỉ báo `missing_major_step` khi một cầu nối bắt buộc hoàn toàn không xuất hiện trong lời giải, kể cả dưới dạng công thức hoặc câu chữ.
 
-    Trước khi kết luận, phải đọc toàn bộ `bieu_thuc_truoc` và toàn bộ `bieu_thuc_sau`, rồi khôi phục chuỗi các bước đã được viết theo đúng thứ tự. Các biểu thức ngăn cách bằng dấu phẩy, chấm phẩy, dấu chấm hoặc xuống dòng vẫn được tính là các bước tường minh, kể cả khi nằm trong cùng một state hoặc cùng một câu.
+    Trước khi kết luận, phải đọc toàn bộ `nội dung trước` và toàn bộ `nội dung sau`, rồi khôi phục chuỗi các bước đã được viết theo đúng thứ tự. Các biểu thức ngăn cách bằng dấu phẩy, chấm phẩy, dấu chấm hoặc xuống dòng vẫn được tính là các bước tường minh, kể cả khi nằm trong cùng một state hoặc cùng một câu.
 
     Nếu biểu thức trung gian đã xuất hiện ở bất kỳ vị trí nào trong nội dung đang kiểm tra thì tuyệt đối không được báo biểu thức đó bị thiếu.
 
@@ -866,15 +866,42 @@ def aggregate_reviewed_comments(
             ),
         )
         advisory = selected["disposition"] == "advisory"
+        context_text = " ".join(
+            str(selected.get(field) or "").lower()
+            for field in ("evidence", "reason", "suggestion")
+        )
+        missing_context = any(
+            marker in context_text
+            for marker in (
+                "thiếu dữ liệu",
+                "thiếu hình",
+                "không có hình",
+                "không có bảng",
+                "chưa cung cấp hình",
+                "chưa cung cấp bảng",
+                "missing image",
+                "missing context",
+            )
+        )
+        repair_intent = (
+            "needs_manual_review"
+            if missing_context
+            else "clean_solution_reasoning"
+            if advisory
+            else "fix_solution_correctness"
+            if selected["source"] == "correctness"
+            else "fix_solution_process"
+        )
         payload = {
             "is_good": False,
             "issues": [{
-                "severity": "warning" if advisory else "needs_review",
+                "severity": "warning" if advisory else "bad",
                 "category": "solution_quality",
                 "location": f"/solutions/{int(selected['solution_index'])}",
                 "reason": selected["reason"],
                 "suggestion": selected["suggestion"],
-                "repair_intent": "clean_solution_reasoning" if advisory else "needs_manual_review",
+                "repair_intent": repair_intent,
+                "disposition": selected["disposition"],
             }],
         }
     return normalize_generated_question_result(
@@ -914,7 +941,7 @@ def _judge_generated_question_direct(
             validator=lambda parsed: validate_direct_correctness_output(parsed, generated_question),
             invalid_json_message="Gemma Correctness không trả JSON hợp lệ.",
             response_format=direct_correctness_response_format(),
-            max_tokens=3072,
+            max_tokens=2048,
             retry_transient_once=True,
         )
 
@@ -934,7 +961,7 @@ def _judge_generated_question_direct(
             validator=lambda parsed: validate_direct_process_output(parsed, generated_question),
             invalid_json_message="Gemma Process & Presentation không trả JSON hợp lệ.",
             response_format=process_presentation_response_format(),
-            max_tokens=3072,
+            max_tokens=768,
             retry_transient_once=True,
         )
 
@@ -963,7 +990,7 @@ def _judge_generated_question_direct(
             ),
             invalid_json_message="Judge kiểm chứng nhận xét không trả JSON hợp lệ.",
             response_format=judge_comments_review_response_format(),
-            max_tokens=3072,
+            max_tokens=1024,
             retry_transient_once=True,
         )
 
