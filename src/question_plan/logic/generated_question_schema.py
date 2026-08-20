@@ -387,7 +387,18 @@ def is_generated_question_object(value: Any) -> bool:
 
 def normalize_generated_question_input(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
-        return [item if isinstance(item, dict) else {"__invalid_item__": item} for item in payload]
+        generated_questions: list[dict[str, Any]] = []
+        for item in payload:
+            if isinstance(item, dict) and isinstance(item.get("generatedQuestions"), list):
+                generated_questions.extend(
+                    child if isinstance(child, dict) else {"__invalid_item__": child}
+                    for child in item["generatedQuestions"]
+                )
+            else:
+                generated_questions.append(
+                    item if isinstance(item, dict) else {"__invalid_item__": item}
+                )
+        return generated_questions
     if isinstance(payload, dict) and isinstance(payload.get("generatedQuestions"), list):
         return [
             item if isinstance(item, dict) else {"__invalid_item__": item}
